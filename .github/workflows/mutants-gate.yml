@@ -1,0 +1,128 @@
+# Temporary: the mutation gate for the test debloat, sharded. Dropped before the PR.
+# A push that changes .github/mutants/ runs the tree and scope named in run.env.
+name: Mutants gate
+
+on:
+  push:
+    branches: [refactor/code-debloat]
+    paths: [".github/mutants/**"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  GGML_NATIVE: "OFF"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/mtarget
+  RUST_TEST_THREADS: "8"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.p.outputs.ref }}
+      label: ${{ steps.p.outputs.label }}
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/mutants
+      - id: p
+        run: |
+          . .github/mutants/run.env
+          echo "ref=$TREE_REF" >> "$GITHUB_OUTPUT"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "shards=$(python3 -c "import json; print(json.dumps(list(range($SHARDS))))")" >> "$GITHUB_OUTPUT"
+
+  # Builds the tree once so every shard starts from a warm dependency cache,
+  # checks the scope lists the expected count, and runs the suite once under
+  # the memory cap the shards use.
+  prime:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/mutants
+          path: gate
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          path: tree
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "tree -> ../mtarget"
+          env-vars: GGML
+          shared-key: mutants
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Scope count
+        working-directory: tree
+        run: |
+          . ../gate/.github/mutants/run.env
+          n=$(cargo mutants --list --config "../gate/.github/mutants/$CONFIG" | wc -l)
+          echo "listed $n, expected $EXPECTED"
+          test "$n" -eq "$EXPECTED"
+      - name: Memory cap for test binaries
+        run: |
+          printf '#!/bin/sh\nulimit -v 8000000\nexec "$@"\n' > "$RUNNER_TEMP/memcap.sh"
+          chmod +x "$RUNNER_TEMP/memcap.sh"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$RUNNER_TEMP/memcap.sh" >> "$GITHUB_ENV"
+      - name: Build and test once
+        working-directory: tree
+        run: time cargo test --tests --no-fail-fast
+
+  mutants:
+    needs: [plan, prime]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/mutants
+          path: gate
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          path: tree
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "tree -> ../mtarget"
+          env-vars: GGML
+          shared-key: mutants
+          save-if: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Memory cap for test binaries
+        run: |
+          printf '#!/bin/sh\nulimit -v 8000000\nexec "$@"\n' > "$RUNNER_TEMP/memcap.sh"
+          chmod +x "$RUNNER_TEMP/memcap.sh"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$RUNNER_TEMP/memcap.sh" >> "$GITHUB_ENV"
+      - name: Mutants
+        working-directory: tree
+        run: |
+          . ../gate/.github/mutants/run.env
+          mkdir -p ../out
+          set +e
+          cargo mutants --config "../gate/.github/mutants/$CONFIG" \
+            --shard "${{ matrix.shard }}/$SHARDS" --sharding round-robin --no-shuffle \
+            --jobs 1 --minimum-test-timeout 90 --timeout-multiplier 1.5 -o ../out
+          echo "rc=$?" > ../out/rc.txt
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-${{ needs.plan.outputs.label }}-${{ matrix.shard }}
+          path: out/
+          retention-days: 14
