@@ -49,10 +49,6 @@ cargo build --no-default-features --features tray,overlay,hooks,recording,mcp
 That is the minimal release build. Dropping `recording,mcp` too leaves out the recording
 feature and `whisrs mcp` (which needs it).
 
-The `whisrs config` TUI's render tests compare each screen with a snapshot of its
-rows in `src/cli/tui/snapshots/`. After a change to a screen that is meant, rewrite them
-with `WHISRS_UPDATE_SNAPSHOTS=1 cargo test --bin whisrs` and read the diff.
-
 ### Running locally
 
 ```bash
@@ -106,6 +102,24 @@ scripts/check-no-avx512.sh
 ```
 
 `cargo fmt` fixes what the first check reports.
+
+## Tests
+
+A change adds a test when it fixes a real bug (the test fails without the fix) or adds a
+contract: an IPC message's wire format, a documented invariant, a public API. Any other change
+extends the test that already covers the behavior, or adds one when none does. A new config
+key needs only its row in `src/cli/tui/schema.rs`: the registry tests check every key.
+
+- One test per behavior, named for the behavior. The cases of one behavior are rows of one
+  table-driven test.
+- Build fixtures with the module's existing test helpers before writing new setup.
+- Test what whisrs decides, not derives, serde or clap attributes, std or other crates.
+- Keep issue numbers out of test names and comments: the commit message carries them.
+- New repro scripts, benchmarks and manual harnesses stay local and are never committed.
+
+The `whisrs config` TUI's render tests compare each screen with a snapshot of its
+rows in `src/cli/tui/snapshots/`. After a change to a screen that is meant, rewrite them
+with `WHISRS_UPDATE_SNAPSHOTS=1 cargo test --bin whisrs` and read the diff.
 
 ## Code Style
 
