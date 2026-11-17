@@ -415,9 +415,17 @@ async fn main() -> Result<()> {
         let llm_commands = context.config.llm_commands.clone();
         let agents = context.agents.agents();
         let hk_tx = cmd_tx.clone();
+        let hk_state = context.state_tx.subscribe_raw();
         tokio::spawn(async move {
             // Hotkey presses feed the shared dispatch loop above.
-            whisrs::hotkey::start_hotkey_listener(&hk_config, &llm_commands, &agents, hk_tx).await;
+            whisrs::hotkey::start_hotkey_listener(
+                &hk_config,
+                &llm_commands,
+                &agents,
+                hk_tx,
+                hk_state,
+            )
+            .await;
         });
     }
 

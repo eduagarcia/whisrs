@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use whisrs::agent::display::AgentOverlayEntry;
 use whisrs::audio::capture::AudioCaptureHandle;
@@ -112,6 +112,52 @@ pub(crate) struct DaemonState {
     /// recording is claimed, cleared at its `TranscriptionDone` (and by
     /// `discard_command_sessions`). Only meaningful while Transcribing.
     pub(crate) agent_transcribing: Option<String>,
+    /// Queued dictations (`[input] queue`) stopped but not yet injected. The
+    /// state machine is back at Idle for them, so the next dictation can
+    /// start; the tray and pill show Transcribing while any is pending
+    /// ([`StateBus::views`]).
+    pub(crate) pending_dictations: usize,
+    /// The order queued dictations are injected in.
+    pub(crate) dictation_queue: DictationQueue,
+}
+
+/// Injection order for queued dictations (`[input] queue`): each takes a
+/// [`QueueSlot`] when it stops, under the dictation lock, and injects its
+/// text only once the slot before it is released.
+#[derive(Default)]
+pub(crate) struct DictationQueue {
+    /// Resolves when the newest slot is released.
+    tail: Option<oneshot::Receiver<()>>,
+}
+
+impl DictationQueue {
+    /// The next slot, after every slot taken so far.
+    pub(crate) fn slot(&mut self) -> QueueSlot {
+        let (done, released) = oneshot::channel();
+        QueueSlot {
+            previous: self.tail.replace(released),
+            _done: done,
+        }
+    }
+}
+
+/// One queued dictation's place in line. Dropping it lets the next one in.
+pub(crate) struct QueueSlot {
+    previous: Option<oneshot::Receiver<()>>,
+    /// Dropped with the slot, which is what wakes the next one.
+    _done: oneshot::Sender<()>,
+}
+
+impl QueueSlot {
+    /// Wait until the slot before this one is released (at once for the
+    /// first). A dictation awaits this before it injects, and also before
+    /// it gives up, so a failed one never lets a later one jump the line.
+    pub(crate) async fn turn(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            // An error is the sender dropped: released all the same.
+            let _ = previous.await;
+        }
+    }
 }
 
 impl DaemonState {
@@ -132,6 +178,8 @@ impl DaemonState {
             tts_origin: None,
             tts_agent: None,
             agent_transcribing: None,
+            pending_dictations: 0,
+            dictation_queue: DictationQueue::default(),
         }
     }
 
@@ -207,7 +255,9 @@ pub(crate) struct AgentVoice {
 ///   queue.
 /// - **ui:** the same, but Idle while the voice belongs to an agent
 ///   ([`DaemonState::agent_voice`]): the tray, the pill overlay and the
-///   GNOME pill signal. Agent mode shows on its own overlay.
+///   GNOME pill signal. Agent mode shows on its own overlay. And
+///   Transcribing while the machine is Idle with a queued dictation still
+///   pending (`[input] queue`).
 /// - **voice:** that agent, for the agent overlay's board.
 ///
 /// Without `[[agents]]` the voice is always `None`, so ui is raw.
@@ -231,7 +281,13 @@ impl StateBus {
     pub(crate) fn views(ds: &DaemonState) -> (State, State, Option<AgentVoice>) {
         let raw = ds.state_machine.state();
         let voice = ds.agent_voice();
-        let ui = if voice.is_some() { State::Idle } else { raw };
+        let ui = if voice.is_some() {
+            State::Idle
+        } else if raw == State::Idle && ds.pending_dictations > 0 {
+            State::Transcribing
+        } else {
+            raw
+        };
         (raw, ui, voice)
     }
 
@@ -345,6 +401,52 @@ mod tests {
     fn views(ds: &DaemonState) -> (State, State, Option<(String, State)>) {
         let (raw, ui, voice) = StateBus::views(ds);
         (raw, ui, voice.map(|v| (v.name, v.state)))
+    }
+
+    /// A queued dictation still pending shows as Transcribing on the tray and
+    /// pill while the machine is Idle, and never hides a recording.
+    #[test]
+    fn a_pending_queued_dictation_shows_as_transcribing() {
+        let mut ds = DaemonState::new();
+        ds.pending_dictations = 1;
+        assert_eq!(views(&ds), (State::Idle, State::Transcribing, None));
+        ds.state_machine.transition(Action::Toggle).unwrap();
+        assert_eq!(views(&ds), (State::Recording, State::Recording, None));
+        ds.state_machine.transition(Action::Cancel).unwrap();
+        ds.pending_dictations = 0;
+        assert_eq!(views(&ds), (State::Idle, State::Idle, None));
+    }
+
+    /// Queue slots come up in the order they were taken, whichever dictation
+    /// is ready first, and a dropped slot lets the next one in.
+    #[tokio::test]
+    async fn queue_slots_take_their_turn_in_order() {
+        use std::sync::Mutex as StdMutex;
+
+        let mut queue = DictationQueue::default();
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        // The first dictation is the slowest to transcribe.
+        for (id, delay_ms) in [(1, 60u64), (2, 20), (3, 0)] {
+            let mut slot = queue.slot();
+            let order = Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                slot.turn().await;
+                order.lock().unwrap().push(id);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+
+        // A slot dropped without taking its turn does not block the next.
+        drop(queue.slot());
+        let mut next = queue.slot();
+        tokio::time::timeout(std::time::Duration::from_secs(1), next.turn())
+            .await
+            .expect("the dropped slot released the line");
     }
 
     fn jarvis(state: State) -> Option<(String, State)> {

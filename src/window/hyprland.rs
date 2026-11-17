@@ -95,12 +95,32 @@ impl WindowTracker for HyprlandTracker {
             .args(["dispatch", "focuswindow", &target])
             .output()
             .context("failed to run hyprctl dispatch focuswindow")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("hyprctl dispatch focuswindow failed: {stderr}");
+        if output.status.success() {
+            return Ok(());
         }
 
-        Ok(())
+        // A Hyprland configured in Lua takes a Lua call as the dispatcher
+        // and rejects the classic `focuswindow address:...` form.
+        let lua = format!("hl.dsp.focus({{ window = '{target}' }})");
+        let lua_output = Command::new("hyprctl")
+            .args(["dispatch", &lua])
+            .output()
+            .context("failed to run hyprctl dispatch hl.dsp.focus")?;
+        if lua_output.status.success() {
+            return Ok(());
+        }
+
+        let detail = |out: &std::process::Output| {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            format!("{} {}", stderr.trim(), stdout.trim())
+                .trim()
+                .to_string()
+        };
+        anyhow::bail!(
+            "hyprctl dispatch focuswindow failed: {}; as a Lua call: {}",
+            detail(&output),
+            detail(&lua_output)
+        )
     }
 }

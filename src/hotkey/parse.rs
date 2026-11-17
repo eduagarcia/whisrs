@@ -57,6 +57,27 @@ pub fn parse_hotkey(s: &str) -> anyhow::Result<HotkeyBinding> {
     Ok(HotkeyBinding { modifiers, trigger })
 }
 
+/// Parse `[hotkeys] double_tap`: modifiers only, joined by `+` (e.g.
+/// "Super+Alt"), with no trigger key. Returns each once, as its left key.
+pub fn parse_modifier_chord(s: &str) -> anyhow::Result<Vec<Key>> {
+    if s.trim().is_empty() {
+        anyhow::bail!("empty double_tap");
+    }
+    let mut chord = Vec::new();
+    for part in s.split('+').map(str::trim) {
+        let key = parse_modifier(part).ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{part}' in double_tap '{s}' is not a modifier. double_tap takes modifiers \
+                 only: Super, Alt, Ctrl, Shift"
+            )
+        })?;
+        if !chord.contains(&key) {
+            chord.push(key);
+        }
+    }
+    Ok(chord)
+}
+
 /// The modifiers a hotkey can hold, in the order a picker writes them.
 pub const MODIFIER_NAMES: [&str; 4] = ["Super", "Ctrl", "Alt", "Shift"];
 

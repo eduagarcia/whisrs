@@ -5575,6 +5575,7 @@ mod tests {
         assert_eq!(
             labels[6..],
             [
+                "double_tap",
                 "Agents",
                 "jarvis",
                 "jarvis new session",
@@ -5584,7 +5585,7 @@ mod tests {
             ]
         );
         // The cursor passes over the headings, both ways.
-        to_path(&mut fixture, "hotkeys.next_profile");
+        to_path(&mut fixture, "hotkeys.double_tap");
         press(&mut fixture.app, "j");
         let screen = &fixture.app.config;
         assert!(matches!(
@@ -5595,7 +5596,7 @@ mod tests {
         let screen = &fixture.app.config;
         assert!(matches!(
             screen.items().get(screen.view().cursor()),
-            Some(Item::Field { path, .. }) if path == "hotkeys.next_profile"
+            Some(Item::Field { path, .. }) if path == "hotkeys.double_tap"
         ));
     }
 

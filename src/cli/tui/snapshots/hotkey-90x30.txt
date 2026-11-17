@@ -7,9 +7,9 @@
    │   Vocabulary              speak         not set                                  │
    │   Replacements            recording     Alt+Shift+M                              │
    │   Typing                  next_profile  not set                                  │
-   │   Hotkeys                                                                        │
-   │   Overlay                 Start and stop dictation. Most setups bind whisrs      │
-   │   Read aloud (TTS)        toggle in the compositor instead.                      │
+   │   Hotkeys                 double_tap    not set                                  │
+   │   Overlay                                                                        │
+   │   Read aloud (TTS)        Start and stop dictation. Most setups bind whisrs      │
    │   Agents     ┏ toggle hotkey ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓              │
    │   LLM        ┃ ▌ modifiers   [x] Super [ ] Ctrl [x] Alt [ ] Shift ┃              │
    │   LLM command┃   key         D                                    ┃              │

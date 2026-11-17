@@ -1152,12 +1152,37 @@ pub(crate) fn take_saved_recoveries() -> Vec<usize> {
 /// the instruction is blank" — an empty instruction buys a round trip and a
 /// non-deterministic rewrite for nothing. `Config::validate` warns about the
 /// second case at startup.
-fn llm_post_process_instruction(config: &Config) -> Option<&str> {
+fn llm_post_process_instruction(config: &Config) -> Option<String> {
     if !config.general.llm_post_process {
         return None;
     }
     let instruction = config.general.llm_instruction.trim();
-    (!instruction.is_empty()).then_some(instruction)
+    if instruction.is_empty() {
+        return None;
+    }
+    Some(with_vocabulary(instruction, &config.general.vocabulary))
+}
+
+/// `instruction` followed by the vocabulary, when there is one: the LLM that
+/// cleans a transcript is told the names and terms the speaker uses, so a
+/// term the backend mis-heard ("pen router") comes out as written
+/// ("OpenRouter"). A backend takes the same terms as its own hint, but some
+/// take none (OpenRouter drops `hotwords`), and none spells them as reliably.
+fn with_vocabulary(instruction: &str, vocabulary: &[String]) -> String {
+    let terms: Vec<&str> = vocabulary
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return instruction.to_string();
+    }
+    format!(
+        "{instruction}\n\nVocabulary: the speaker uses these names and terms. When the transcript \
+         holds something that sounds like one of them, write it exactly as listed. Do not add a \
+         term that was not spoken.\n{}",
+        terms.join(", ")
+    )
 }
 
 /// What a finished dictation produced: the text that reached the cursor, and
@@ -1262,7 +1287,7 @@ pub(crate) async fn apply_llm_post_process(
 
     let rewritten = match tokio::time::timeout(
         LLM_POST_PROCESS_TIMEOUT,
-        llm::rewrite_text(&llm_config, &text, instruction),
+        llm::rewrite_text(&llm_config, &text, &instruction),
     )
     .await
     {
@@ -1316,6 +1341,24 @@ pub(crate) async fn process_recording_batch(
     context: &DaemonContext,
     language: &str,
 ) -> Result<DictationOutcome> {
+    let outcome = transcribe_recording_batch(capture, context, language).await?;
+    if outcome.text.is_empty() {
+        // Gated, echo-dropped, or empty — the helper already said so.
+        return Ok(outcome);
+    }
+    Ok(inject_dictation(outcome, window_id, context).await)
+}
+
+/// The first half of [`process_recording_batch`]: collect the audio,
+/// transcribe it and run `[general] llm_post_process`. Nothing is typed. An
+/// empty text means there is nothing to inject. Split out so a queued
+/// dictation (`[input] queue`) can do this part while another one records,
+/// and wait its turn only for [`inject_dictation`].
+pub(crate) async fn transcribe_recording_batch(
+    capture: Option<AudioCaptureHandle>,
+    context: &DaemonContext,
+    language: &str,
+) -> Result<DictationOutcome> {
     let samples = match capture {
         Some(cap) => cap.stop_and_collect().await?,
         None => anyhow::bail!("no audio capture to collect"),
@@ -1343,8 +1386,18 @@ pub(crate) async fn process_recording_batch(
     // is inverted here and `Config::validate` warns instead. The rewritten
     // text is what this function returns, so history records what was actually
     // typed, tagged by `history_backend_tag` with whether the LLM produced it.
-    let outcome = apply_llm_post_process(text, context).await;
+    Ok(apply_llm_post_process(text, context).await)
+}
 
+/// The second half of [`process_recording_batch`]: put a finished dictation
+/// at the cursor. Returns the outcome with the text as it was injected
+/// (sanitized, line breaks folded at a terminal), which is what the history
+/// records.
+pub(crate) async fn inject_dictation(
+    outcome: DictationOutcome,
+    window_id: Option<&str>,
+    context: &DaemonContext,
+) -> DictationOutcome {
     let keys = KeystrokeSettings::from_config(&context.config.input);
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
@@ -1354,7 +1407,9 @@ pub(crate) async fn process_recording_batch(
     // Skipped under `[input] clipboard_only`: nothing is injected, so raising
     // the old window would only yank focus away from wherever the user moved
     // to (and burn 100 ms doing it). Matches the streaming path's refocus gate.
-    if !clipboard_only {
+    // `[input] refocus = false` skips it too: the text goes to whatever is
+    // focused now.
+    if !clipboard_only && context.config.input.refocus {
         if let Some(wid) = window_id {
             if let Err(e) = context.window_tracker.focus_window(wid) {
                 warn!("failed to restore window focus: {e}");
@@ -1403,7 +1458,7 @@ pub(crate) async fn process_recording_batch(
             outcome.text = folded;
         }
     }
-    let text_clone = outcome.text.clone();
+    let text_clone = with_trailing_space(&outcome.text, context.config.input.trailing_space);
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &text_clone,
@@ -1426,7 +1481,17 @@ pub(crate) async fn process_recording_batch(
         Err(e) => warn!("failed to join injection task: {e}"),
     }
 
-    Ok(outcome)
+    outcome
+}
+
+/// `text` as it is injected under `[input] trailing_space`: followed by one
+/// space, unless it is empty or already ends in whitespace.
+fn with_trailing_space(text: &str, enabled: bool) -> String {
+    if enabled && text.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+        format!("{text} ")
+    } else {
+        text.to_string()
+    }
 }
 
 /// The new text when a `Cow`-returning filter changed something, else `None`,
@@ -2883,8 +2948,42 @@ pub(crate) mod tests {
         let config =
             config_from("llm_post_process = true\nllm_instruction = \"  Translate to German.  \"");
         assert_eq!(
-            llm_post_process_instruction(&config),
+            llm_post_process_instruction(&config).as_deref(),
             Some("Translate to German.")
+        );
+    }
+
+    #[test]
+    fn trailing_space_follows_a_dictation_once() {
+        assert_eq!(with_trailing_space("Done.", true), "Done. ");
+        assert_eq!(with_trailing_space("Done. ", true), "Done. ");
+        assert_eq!(with_trailing_space("line\n", true), "line\n");
+        assert_eq!(with_trailing_space("", true), "");
+        assert_eq!(with_trailing_space("Done.", false), "Done.");
+    }
+
+    /// The vocabulary follows the instruction, so the LLM spells the terms
+    /// the backend mis-heard; blank terms are dropped, and with no term the
+    /// instruction is sent as written.
+    #[test]
+    fn llm_post_process_instruction_carries_the_vocabulary() {
+        let config = config_from(
+            "llm_post_process = true\nllm_instruction = \"Clean it.\"\n\
+             vocabulary = [\"OpenRouter\", \"  \", \"AGENTS.md\"]",
+        );
+        let instruction = llm_post_process_instruction(&config).unwrap();
+        assert!(
+            instruction.starts_with("Clean it.\n\nVocabulary:"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.ends_with("\nOpenRouter, AGENTS.md"),
+            "{instruction}"
+        );
+
+        assert_eq!(
+            with_vocabulary("Clean it.", &["  ".to_string()]),
+            "Clean it."
         );
     }
 

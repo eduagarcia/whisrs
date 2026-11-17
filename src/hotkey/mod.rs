@@ -7,18 +7,28 @@ mod parse;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use evdev::{AttributeSetRef, Device, EventType, InputEventKind, Key};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::agent::{Agent, AgentAction};
 use crate::llm::LlmCommandConfig;
 #[cfg(feature = "recording")]
 use crate::recording::{RecordingAction, RecordingOptions};
-use crate::{Command, HotkeyConfig};
-pub use parse::{hotkey_parts, parse_hotkey, HotkeyBinding, KEY_NAMES, MODIFIER_NAMES};
+use crate::{Command, HotkeyConfig, State};
+pub use parse::{
+    hotkey_parts, parse_hotkey, parse_modifier_chord, HotkeyBinding, KEY_NAMES, MODIFIER_NAMES,
+};
+
+/// `[hotkeys] double_tap`: the longest the modifiers may stay down for the
+/// press to count as a tap.
+const TAP_MAX_HOLD: Duration = Duration::from_millis(800);
+
+/// `[hotkeys] double_tap`: the longest gap between the two taps, release to
+/// release.
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(600);
 
 /// Maximum number of attempts to find keyboard input devices.
 const HOTKEY_MAX_RETRIES: u32 = 10;
@@ -38,15 +48,21 @@ struct HotkeyAction {
 /// matching commands through the provided channel. Retries with exponential
 /// backoff if no keyboards are found yet (common on boot when the daemon
 /// starts before input devices are fully initialized). Runs until dropped.
+///
+/// `state` is the daemon's state as it is broadcast: `[hotkeys] double_tap`
+/// reads it to tell a tap that stops a dictation from the first of two that
+/// start one.
 pub async fn start_hotkey_listener(
     config: &HotkeyConfig,
     llm_commands: &[LlmCommandConfig],
     agents: &[Agent],
     cmd_tx: mpsc::Sender<Command>,
+    state: watch::Receiver<State>,
 ) {
     let actions = build_actions(config, llm_commands, agents);
+    let chord = double_tap_chord(config);
 
-    if actions.is_empty() {
+    if actions.is_empty() && chord.is_none() {
         debug!("no hotkeys configured");
         return;
     }
@@ -110,9 +126,12 @@ pub async fn start_hotkey_listener(
             })
             .collect();
         let tx = cmd_tx.clone();
+        let taps = chord
+            .clone()
+            .map(|chord| (ChordTaps::new(chord), state.clone()));
 
         tokio::spawn(async move {
-            if let Err(e) = listen_device(device, &actions_clone, tx).await {
+            if let Err(e) = listen_device(device, &actions_clone, taps, tx).await {
                 debug!("hotkey listener for '{name}' stopped: {e}");
             }
         });
@@ -237,6 +256,118 @@ fn build_actions(
     }
 
     actions
+}
+
+/// `[hotkeys] double_tap` as its modifier keys, or `None` when it is unset
+/// or invalid (warned about, like a bad binding).
+fn double_tap_chord(config: &HotkeyConfig) -> Option<Vec<Key>> {
+    let spec = config.double_tap.as_deref()?;
+    match parse_modifier_chord(spec) {
+        Ok(chord) => {
+            info!("hotkey: double_tap = {spec} (twice starts a dictation, once stops it)");
+            Some(chord)
+        }
+        Err(e) => {
+            warn!("invalid double_tap '{spec}': {e}");
+            None
+        }
+    }
+}
+
+/// What a release of the `double_tap` modifiers amounts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tap {
+    /// One tap, with no other shortly before it.
+    Single,
+    /// The second of two taps in quick succession.
+    Double,
+}
+
+/// Tap detection for `[hotkeys] double_tap`, one per keyboard. A tap is the
+/// modifiers pressed together with nothing else held, and released within
+/// [`TAP_MAX_HOLD`]. Any other key pressed in between is a shortcut being
+/// used (Super+Alt+Left), not a tap, and forgets the tap before it too.
+struct ChordTaps {
+    /// The modifiers, as left keys.
+    chord: Vec<Key>,
+    /// When the modifiers became the only keys held; cleared when one is
+    /// released or another key joins them.
+    down_at: Option<Instant>,
+    /// The last tap, while a second one would still make it a double.
+    last_tap: Option<Instant>,
+}
+
+impl ChordTaps {
+    fn new(chord: Vec<Key>) -> Self {
+        Self {
+            chord,
+            down_at: None,
+            last_tap: None,
+        }
+    }
+
+    fn in_chord(&self, key: Key) -> bool {
+        self.chord.contains(&left_modifier(key))
+    }
+
+    /// `key` went down; `held` already holds it.
+    fn press(&mut self, key: Key, held: &HashSet<Key>, now: Instant) {
+        if !self.in_chord(key) {
+            self.down_at = None;
+            self.last_tap = None;
+            return;
+        }
+        let only_modifiers = held.iter().all(|k| MODIFIER_KEYS.contains(k));
+        self.down_at = (only_modifiers && modifiers_held(held, &self.chord)).then_some(now);
+    }
+
+    /// `key` went up. The first release that breaks the held modifiers is
+    /// what counts; the other modifiers' releases then find nothing.
+    fn release(&mut self, key: Key, now: Instant) -> Option<Tap> {
+        if !self.in_chord(key) {
+            return None;
+        }
+        let down_at = self.down_at.take()?;
+        if now.duration_since(down_at) > TAP_MAX_HOLD {
+            self.last_tap = None;
+            return None;
+        }
+        match self.last_tap.take() {
+            Some(last) if now.duration_since(last) <= DOUBLE_TAP_WINDOW => Some(Tap::Double),
+            _ => {
+                self.last_tap = Some(now);
+                Some(Tap::Single)
+            }
+        }
+    }
+
+    /// Forget the last tap: it stopped a dictation, so it is not the first
+    /// of two that start one.
+    fn forget(&mut self) {
+        self.last_tap = None;
+    }
+}
+
+/// The command a tap sends, if any: one tap stops a dictation in progress,
+/// two start one. `None` for a first tap with nothing recording.
+fn tap_command(tap: Tap, state: State) -> Option<Command> {
+    let toggle = Command::Toggle { language: None };
+    match (tap, state) {
+        (_, State::Recording) => Some(toggle),
+        (Tap::Double, _) => Some(toggle),
+        (Tap::Single, _) => None,
+    }
+}
+
+/// A right-hand modifier as its left one; any other key unchanged.
+fn left_modifier(key: Key) -> Key {
+    match key {
+        Key::KEY_RIGHTMETA => Key::KEY_LEFTMETA,
+        Key::KEY_RIGHTALT => Key::KEY_LEFTALT,
+        Key::KEY_RIGHTCTRL => Key::KEY_LEFTCTRL,
+        Key::KEY_RIGHTSHIFT => Key::KEY_LEFTSHIFT,
+        other => other,
+    }
 }
 
 /// Modifier keys, left and right. A physically held one turns injected
@@ -447,6 +578,7 @@ fn diff_nodes<'a>(
 async fn listen_device(
     device: Device,
     actions: &[(Vec<Key>, Key, Command)],
+    mut taps: Option<(ChordTaps, watch::Receiver<State>)>,
     cmd_tx: mpsc::Sender<Command>,
 ) -> anyhow::Result<()> {
     // Track which keys are currently held.
@@ -471,6 +603,9 @@ async fn listen_device(
             1 => {
                 // Key press.
                 held_keys.insert(key);
+                if let Some((taps, _)) = &mut taps {
+                    taps.press(key, &held_keys, Instant::now());
+                }
 
                 // Check if any hotkey combo matches.
                 for (modifiers, trigger, command) in actions {
@@ -483,6 +618,18 @@ async fn listen_device(
             0 => {
                 // Key release.
                 held_keys.remove(&key);
+                if let Some((taps, state)) = &mut taps {
+                    if let Some(tap) = taps.release(key, Instant::now()) {
+                        let state = *state.borrow();
+                        if let Some(command) = tap_command(tap, state) {
+                            debug!("double_tap: {tap:?} while {state:?}");
+                            // A tap that stopped a dictation is not the
+                            // first of two that start the next one.
+                            taps.forget();
+                            let _ = cmd_tx.send(command).await;
+                        }
+                    }
+                }
             }
             _ => {} // Repeat (2) — ignore.
         }
@@ -576,6 +723,141 @@ mod tests {
         }
     }
 
+    /// Press then release the Super+Alt chord on `taps`, `hold` apart,
+    /// starting at `at`. Returns what the release amounted to.
+    fn tap_at(taps: &mut ChordTaps, at: Instant, hold: Duration) -> Option<Tap> {
+        let mut held = HashSet::new();
+        held.insert(Key::KEY_LEFTMETA);
+        taps.press(Key::KEY_LEFTMETA, &held, at);
+        held.insert(Key::KEY_LEFTALT);
+        taps.press(Key::KEY_LEFTALT, &held, at);
+        let up = at + hold;
+        let tap = taps.release(Key::KEY_LEFTALT, up);
+        // The other modifier's release finds nothing left to count.
+        assert_eq!(taps.release(Key::KEY_LEFTMETA, up), None);
+        tap
+    }
+
+    fn super_alt() -> ChordTaps {
+        ChordTaps::new(parse_modifier_chord("Super+Alt").unwrap())
+    }
+
+    #[test]
+    fn two_quick_taps_are_a_double() {
+        let mut taps = super_alt();
+        let t0 = Instant::now();
+        let short = Duration::from_millis(80);
+        assert_eq!(tap_at(&mut taps, t0, short), Some(Tap::Single));
+        assert_eq!(
+            tap_at(&mut taps, t0 + Duration::from_millis(250), short),
+            Some(Tap::Double)
+        );
+        // The pair is spent: the next tap starts over.
+        assert_eq!(
+            tap_at(&mut taps, t0 + Duration::from_millis(500), short),
+            Some(Tap::Single)
+        );
+    }
+
+    #[test]
+    fn slow_taps_and_long_holds_are_not_a_double() {
+        let mut taps = super_alt();
+        let t0 = Instant::now();
+        let short = Duration::from_millis(80);
+        assert_eq!(tap_at(&mut taps, t0, short), Some(Tap::Single));
+        // Too long after the first.
+        assert_eq!(
+            tap_at(&mut taps, t0 + Duration::from_secs(2), short),
+            Some(Tap::Single)
+        );
+        // Held too long to be a tap at all, and it forgets the one before.
+        assert_eq!(
+            tap_at(
+                &mut taps,
+                t0 + Duration::from_millis(2200),
+                Duration::from_secs(2)
+            ),
+            None
+        );
+        assert_eq!(
+            tap_at(&mut taps, t0 + Duration::from_millis(4300), short),
+            Some(Tap::Single)
+        );
+    }
+
+    #[test]
+    fn another_key_makes_it_a_shortcut_not_a_tap() {
+        let mut taps = super_alt();
+        let t0 = Instant::now();
+        // Super+Alt+Left.
+        let mut held = HashSet::from([Key::KEY_LEFTMETA]);
+        taps.press(Key::KEY_LEFTMETA, &held, t0);
+        held.insert(Key::KEY_LEFTALT);
+        taps.press(Key::KEY_LEFTALT, &held, t0);
+        held.insert(Key::KEY_LEFT);
+        taps.press(Key::KEY_LEFT, &held, t0);
+        assert_eq!(taps.release(Key::KEY_LEFT, t0), None);
+        assert_eq!(taps.release(Key::KEY_LEFTALT, t0), None);
+        assert_eq!(taps.release(Key::KEY_LEFTMETA, t0), None);
+
+        // A third modifier is a different chord (Ctrl+Super+Alt).
+        let mut held = HashSet::from([Key::KEY_LEFTCTRL, Key::KEY_LEFTMETA]);
+        taps.press(Key::KEY_LEFTMETA, &held, t0);
+        held.insert(Key::KEY_LEFTALT);
+        taps.press(Key::KEY_LEFTALT, &held, t0);
+        assert_eq!(taps.release(Key::KEY_LEFTALT, t0), None);
+
+        // A key typed between two taps forgets the first.
+        let short = Duration::from_millis(80);
+        assert_eq!(tap_at(&mut taps, t0, short), Some(Tap::Single));
+        taps.press(Key::KEY_A, &HashSet::from([Key::KEY_A]), t0);
+        assert_eq!(
+            tap_at(&mut taps, t0 + Duration::from_millis(200), short),
+            Some(Tap::Single)
+        );
+    }
+
+    #[test]
+    fn right_hand_modifiers_tap_too() {
+        let mut taps = super_alt();
+        let t0 = Instant::now();
+        let mut held = HashSet::from([Key::KEY_RIGHTALT]);
+        taps.press(Key::KEY_RIGHTALT, &held, t0);
+        held.insert(Key::KEY_LEFTMETA);
+        taps.press(Key::KEY_LEFTMETA, &held, t0);
+        assert_eq!(taps.release(Key::KEY_LEFTMETA, t0), Some(Tap::Single));
+    }
+
+    /// One tap stops a dictation; it takes two to start one.
+    #[test]
+    fn taps_start_with_two_and_stop_with_one() {
+        let toggle = |c: Option<Command>| matches!(c, Some(Command::Toggle { language: None }));
+        assert!(tap_command(Tap::Single, State::Idle).is_none());
+        assert!(toggle(tap_command(Tap::Double, State::Idle)));
+        assert!(toggle(tap_command(Tap::Single, State::Recording)));
+        assert!(toggle(tap_command(Tap::Double, State::Recording)));
+        assert!(tap_command(Tap::Single, State::Transcribing).is_none());
+    }
+
+    #[test]
+    fn double_tap_takes_modifiers_only() {
+        assert_eq!(
+            parse_modifier_chord("Super+Alt").unwrap(),
+            vec![Key::KEY_LEFTMETA, Key::KEY_LEFTALT]
+        );
+        assert_eq!(
+            parse_modifier_chord("alt + ALT").unwrap(),
+            vec![Key::KEY_LEFTALT]
+        );
+        assert!(parse_modifier_chord("Super+D").is_err());
+        assert!(parse_modifier_chord("").is_err());
+        let config = HotkeyConfig {
+            double_tap: Some("Super+D".to_string()),
+            ..Default::default()
+        };
+        assert!(double_tap_chord(&config).is_none());
+    }
+
     fn all_hotkeys_set() -> HotkeyConfig {
         HotkeyConfig {
             toggle: Some("Super+Shift+W".to_string()),
@@ -584,6 +866,8 @@ mod tests {
             speak: Some("Super+Shift+R".to_string()),
             recording: Some("Super+Shift+M".to_string()),
             next_profile: Some("Super+Shift+P".to_string()),
+            // Not a `fixed` binding: `double_tap_chord` reads it.
+            double_tap: None,
         }
     }
 

@@ -230,6 +230,11 @@ impl AsrSidecarBackend {
         if let Some(prompt) = &config.prompt {
             form = form.text("hotwords", prompt.clone());
         }
+        if let Some(provider) =
+            openrouter_provider_field(&self.url, &config.model, &config.keyterms)
+        {
+            form = form.text("provider", provider);
+        }
 
         let url = effective_url(&self.url);
         if url != self.url {
@@ -453,6 +458,32 @@ fn coarse_segment_ms(transcript: &Transcript) -> Option<u64> {
 /// Only the *path* carries that noise. A trailing slash inside a query value or
 /// a fragment is data the user typed, so a URL carrying `?` or `#` is posted
 /// exactly as configured rather than silently rewritten.
+/// The `provider` form field that carries the vocabulary to an OpenRouter
+/// model that takes one ([`openrouter_takes_vocabulary`]), as the JSON text
+/// OpenRouter parses: `{"options":{"azure":{"phraseList":{"phrases":[...]}}}}`.
+/// `None` off OpenRouter, for a model that takes none, and without terms.
+///
+/// [`openrouter_takes_vocabulary`]: crate::config::catalog::openrouter_takes_vocabulary
+fn openrouter_provider_field(url: &str, model: &str, keyterms: &[String]) -> Option<String> {
+    use crate::config::catalog::{is_openrouter, openrouter_takes_vocabulary};
+
+    if !is_openrouter(url) || !openrouter_takes_vocabulary(model) {
+        return None;
+    }
+    let phrases: Vec<&str> = keyterms
+        .iter()
+        .map(|term| term.trim())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if phrases.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::json!({ "options": { "azure": { "phraseList": { "phrases": phrases } } } })
+            .to_string(),
+    )
+}
+
 fn effective_url(url: &str) -> &str {
     if url.contains('?') || url.contains('#') {
         return url;
@@ -682,6 +713,32 @@ mod tests {
             head.starts_with("POST /transcribe HTTP/1.1\r\n"),
             "expected the trailing slash to be trimmed off the request line: {head}"
         );
+    }
+
+    #[test]
+    fn the_vocabulary_goes_to_mai_on_openrouter_as_a_phrase_list() {
+        let url = "https://openrouter.ai/api/v1/audio/transcriptions";
+        let terms = vec![
+            "Claude Code".to_string(),
+            "  ".to_string(),
+            "AWS".to_string(),
+        ];
+        let field = openrouter_provider_field(url, "microsoft/mai-transcribe-2", &terms).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&field).unwrap();
+        assert_eq!(
+            json["options"]["azure"]["phraseList"]["phrases"],
+            serde_json::json!(["Claude Code", "AWS"])
+        );
+
+        // Another model, another server, or no terms: no field.
+        assert!(openrouter_provider_field(url, "elevenlabs/scribe-v2", &terms).is_none());
+        assert!(openrouter_provider_field(
+            "http://127.0.0.1:8000/v1/audio/transcriptions",
+            "microsoft/mai-transcribe-2",
+            &terms
+        )
+        .is_none());
+        assert!(openrouter_provider_field(url, "microsoft/mai-transcribe-2", &[]).is_none());
     }
 
     #[test]

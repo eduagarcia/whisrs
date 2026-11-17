@@ -264,6 +264,12 @@ pub struct HotkeyConfig {
     /// Hotkey to switch to the next config profile: base, then the
     /// profiles by name, wrapping (e.g. "Super+Shift+P").
     pub next_profile: Option<String>,
+    /// Modifiers to tap together, with no other key, to dictate (e.g.
+    /// "Super+Alt"): tap them twice to start a dictation, once to stop it.
+    /// Unlike the other bindings it has no trigger key, so it is not a
+    /// [`parse_hotkey`](crate::hotkey::parse_hotkey) string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_tap: Option<String>,
 }
 
 /// Recording-lifecycle hooks. `media_auto_pause` pauses the MPRIS players
@@ -901,6 +907,24 @@ pub struct InputConfig {
     /// strings in `WM_CLASS`, falling back to the first.
     #[serde(default)]
     pub terminal_classes: Vec<String>,
+    /// Focus the window a dictation started in before its text is typed or
+    /// pasted (the default). `false` leaves the focus alone: the text lands
+    /// in whatever is focused when it is ready.
+    #[serde(default = "default_true")]
+    pub refocus: bool,
+    /// Queue batch dictations: stopping a dictation returns to idle at once,
+    /// its audio is transcribed (and post-processed) in the background, and
+    /// the text is injected when it is ready. A new dictation can start, and
+    /// even stop, while earlier ones are still being transcribed; the texts
+    /// are injected in the order the dictations were stopped. Batch backends
+    /// only: a streaming backend types as it hears.
+    #[serde(default)]
+    pub queue: bool,
+    /// Follow each batch dictation with one space (unless it already ends in
+    /// whitespace), so the next dictation does not run into it. The history
+    /// keeps the text without it.
+    #[serde(default)]
+    pub trailing_space: bool,
 }
 
 impl Default for InputConfig {
@@ -913,6 +937,9 @@ impl Default for InputConfig {
             clipboard_fallback: false,
             clipboard_only: false,
             terminal_classes: Vec::new(),
+            refocus: true,
+            queue: false,
+            trailing_space: false,
         }
     }
 }
@@ -3237,11 +3264,18 @@ impl Config {
                 .prompt
                 .as_deref()
                 .is_some_and(|p| !p.trim().is_empty());
-        let has_terms = self
-            .general
-            .vocabulary
-            .iter()
-            .any(|term| !term.trim().is_empty());
+        // The vocabulary does reach a model that takes a phrase list
+        // (MAI-Transcribe): the backend sends it in the `provider` field.
+        let vocabulary_sent = self
+            .asr_sidecar
+            .as_ref()
+            .is_some_and(|a| crate::config::catalog::openrouter_takes_vocabulary(&a.model));
+        let has_terms = !vocabulary_sent
+            && self
+                .general
+                .vocabulary
+                .iter()
+                .any(|term| !term.trim().is_empty());
         let ignored = match (has_prompt, has_terms) {
             (false, false) => return Vec::new(),
             (true, false) => "[general] prompt is",
@@ -3250,9 +3284,9 @@ impl Config {
         };
         vec![ConfigWarning {
             message: format!(
-                "{ignored} ignored on OpenRouter ([asr-sidecar] url): none of its \
-                 speech-to-text models takes a prompt or vocabulary. [replacements] still \
-                 fixes words after transcription."
+                "{ignored} ignored on OpenRouter ([asr-sidecar] url): its speech-to-text \
+                 models take no prompt, and only microsoft/mai-transcribe takes the \
+                 vocabulary. [replacements] still fixes words after transcription."
             ),
         }]
     }
@@ -5914,6 +5948,7 @@ mod tests {
             speak: None,
             recording: None,
             next_profile: None,
+            double_tap: None,
         });
         config
             .llm_commands
@@ -5976,6 +6011,7 @@ mod tests {
             speak: Some("Meta+D".to_string()),
             recording: None,
             next_profile: None,
+            double_tap: None,
         });
 
         let warnings = config.validate().unwrap();
@@ -7089,6 +7125,7 @@ mod tests {
             speak: Some("Super+Shift+R".to_string()),
             recording: Some("Super+Shift+M".to_string()),
             next_profile: None,
+            double_tap: None,
         });
         config
             .llm_commands

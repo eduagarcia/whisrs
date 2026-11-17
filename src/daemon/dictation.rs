@@ -9,13 +9,13 @@ use whisrs::audio::feedback;
 use whisrs::state::Action;
 use whisrs::{validate_language_override, Response, State};
 
-use crate::context::{DaemonContext, DaemonState};
+use crate::context::{DaemonContext, DaemonState, QueueSlot};
 use crate::injection::KeystrokeSettings;
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
-    build_transcription_config, format_no_microphone_error, history_backend_tag,
-    process_recording_batch, run_streaming_pipeline, save_history_entry, DictationOutcome,
-    StreamingPipelineParams,
+    build_transcription_config, format_no_microphone_error, history_backend_tag, inject_dictation,
+    process_recording_batch, run_streaming_pipeline, save_history_entry,
+    transcribe_recording_batch, DictationOutcome, StreamingPipelineParams,
 };
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
@@ -241,6 +241,34 @@ pub(crate) async fn handle_toggle(
                         }
                     }
 
+                    // `[input] queue`: a batch dictation is finished in the
+                    // background. The machine goes back to Idle here, so
+                    // the next dictation can start before this one is typed.
+                    if context.config.input.queue && streaming_task.is_none() {
+                        if let Err(e) = ds.state_machine.transition(Action::TranscriptionDone) {
+                            return Response::Error {
+                                message: e.to_string(),
+                            };
+                        }
+                        ds.pending_dictations += 1;
+                        let job = QueuedDictation {
+                            capture,
+                            window_id,
+                            language: session_language,
+                            started_at: recording_started_at,
+                            slot: ds.dictation_queue.slot(),
+                        };
+                        // Shows Transcribing while it is pending.
+                        context.state_tx.publish(&ds);
+                        drop(ds);
+                        tokio::spawn(finish_queued_dictation(
+                            job,
+                            Arc::clone(&daemon_state),
+                            Arc::clone(&context),
+                        ));
+                        return Response::Ok { state: State::Idle };
+                    }
+
                     // Release lock before slow operations.
                     drop(ds);
 
@@ -288,47 +316,8 @@ pub(crate) async fn handle_toggle(
                             if let Some(level_tx) = &context.overlay_level_tx {
                                 let _ = level_tx.send(0.0);
                             }
-                            match result {
-                                Ok(dictation) => {
-                                    info!("transcription complete: {} chars", dictation.text.len());
-                                    if !dictation.text.is_empty() {
-                                        // The tag records whether the words
-                                        // came from the backend or from the
-                                        // LLM that rewrote them, so `whisrs
-                                        // log` can tell the two apart.
-                                        save_history_entry(
-                                            context.config.general.history,
-                                            &dictation.text,
-                                            &history_backend_tag(
-                                                &context.config.general.backend,
-                                                dictation.post_processed,
-                                            ),
-                                            &session_language,
-                                            duration_secs,
-                                        );
-                                    }
-                                    if context.config.general.audio_feedback {
-                                        feedback::play_done(
-                                            context.config.general.audio_feedback_volume,
-                                        );
-                                    }
-                                    if context.notify_state() {
-                                        let preview = truncate_preview(&dictation.text, 77);
-                                        send_notification("whisrs", &format!("Done: {preview}"));
-                                    }
-                                    Response::Ok { state: new_state }
-                                }
-                                Err(e) => {
-                                    error!("transcription failed: {e:#}");
-                                    if context.notify_error() {
-                                        send_notification(
-                                            "whisrs",
-                                            &format!("Transcription failed: {e}"),
-                                        );
-                                    }
-                                    Response::Ok { state: new_state }
-                                }
-                            }
+                            report_dictation(&context, &result, &session_language, duration_secs);
+                            Response::Ok { state: new_state }
                         }
                         // For STREAMING backends, run_streaming_pipeline's tail
                         // (pipeline.rs) often already moved Transcribing → Idle,
@@ -378,6 +367,95 @@ pub(crate) async fn handle_toggle(
             message: "cannot toggle while reading aloud — cancel read-aloud first".to_string(),
         },
     }
+}
+
+/// What a finished dictation leaves behind: the history entry, the done
+/// tone and the toast, or the error. Shared by the toggle that waits for its
+/// dictation and the queued one (`[input] queue`).
+fn report_dictation(
+    context: &DaemonContext,
+    result: &anyhow::Result<DictationOutcome>,
+    language: &str,
+    duration_secs: f64,
+) {
+    match result {
+        Ok(dictation) => {
+            info!("transcription complete: {} chars", dictation.text.len());
+            if !dictation.text.is_empty() {
+                // The tag records whether the words came from the backend or
+                // from the LLM that rewrote them, so `whisrs log` can tell
+                // the two apart.
+                save_history_entry(
+                    context.config.general.history,
+                    &dictation.text,
+                    &history_backend_tag(&context.config.general.backend, dictation.post_processed),
+                    language,
+                    duration_secs,
+                );
+            }
+            if context.config.general.audio_feedback {
+                feedback::play_done(context.config.general.audio_feedback_volume);
+            }
+            if context.notify_state() {
+                let preview = truncate_preview(&dictation.text, 77);
+                send_notification("whisrs", &format!("Done: {preview}"));
+            }
+        }
+        Err(e) => {
+            error!("transcription failed: {e:#}");
+            if context.notify_error() {
+                send_notification("whisrs", &format!("Transcription failed: {e}"));
+            }
+        }
+    }
+}
+
+/// A stopped batch dictation that finishes in the background (`[input]
+/// queue`): what the stop-press took out of [`DaemonState`], and its place
+/// in the injection order.
+struct QueuedDictation {
+    capture: Option<AudioCaptureHandle>,
+    window_id: Option<String>,
+    language: String,
+    started_at: Option<std::time::Instant>,
+    slot: QueueSlot,
+}
+
+/// Transcribe a queued dictation, inject it when its turn comes, and take it
+/// off the pending count. The transcription (and the LLM pass) of several
+/// run side by side; only the injection waits, so the texts land in the
+/// order the dictations were stopped.
+async fn finish_queued_dictation(
+    job: QueuedDictation,
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+) {
+    let QueuedDictation {
+        capture,
+        window_id,
+        language,
+        started_at,
+        mut slot,
+    } = job;
+
+    let transcribed = transcribe_recording_batch(capture, &context, &language).await;
+    // Also awaited by a failed or empty one, so it never lets a later
+    // dictation in ahead of an earlier one.
+    slot.turn().await;
+    let result = match transcribed {
+        Ok(outcome) if !outcome.text.is_empty() => {
+            Ok(inject_dictation(outcome, window_id.as_deref(), &context).await)
+        }
+        other => other,
+    };
+    drop(slot);
+
+    let duration_secs = started_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+    let mut ds = daemon_state.lock().await;
+    ds.pending_dictations = ds.pending_dictations.saturating_sub(1);
+    context.state_tx.publish(&ds);
+    drop(ds);
+    report_dictation(&context, &result, &language, duration_secs);
 }
 
 pub(crate) async fn handle_cancel(

@@ -917,6 +917,17 @@ pub fn is_openrouter(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an OpenRouter speech-to-text `model` takes a vocabulary. OpenRouter
+/// drops the `hotwords` field for every model, but it forwards a `provider`
+/// field to the provider that runs the model, and Azure's MAI-Transcribe
+/// models take a phrase list there (`provider.options.azure.phraseList`).
+pub fn openrouter_takes_vocabulary(model: &str) -> bool {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("microsoft/mai-transcribe")
+}
+
 /// The host name of `url`, lowercased, and its port. The scheme, user info
 /// and path are cut off, and a URL without a scheme works too. Only picks
 /// a list ([`llm_models`]); [`is_openrouter`], which decides where a key

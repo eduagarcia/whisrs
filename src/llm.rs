@@ -45,6 +45,14 @@ pub struct LlmConfig {
     /// API base URL. Defaults to OpenAI. Set to Groq or other provider URL.
     #[serde(default = "default_llm_url")]
     pub api_url: String,
+    /// `reasoning_effort` sent with every request (`"low"`, `"medium"`, ...),
+    /// for reasoning models. Unset sends none: the endpoint's default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// `service_tier` sent with every request (`"priority"` is OpenAI's fast
+    /// tier). Unset sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -53,6 +61,8 @@ impl Default for LlmConfig {
             api_key: String::new(),
             model: default_llm_model(),
             api_url: default_llm_url(),
+            reasoning_effort: None,
+            service_tier: None,
         }
     }
 }
@@ -101,6 +111,10 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
 }
 
 /// One message of a chat request ([`chat`]).
@@ -477,6 +491,23 @@ fn resolve_api_key(config: &LlmConfig) -> anyhow::Result<String> {
 /// How much of an error answer's body an error carries.
 const ERROR_BODY_CHARS: usize = 300;
 
+/// The client every LLM request goes through. One for the whole process, so
+/// a dictation's post-processing reuses the connection the last one opened
+/// instead of paying a TLS handshake each time.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// `value` trimmed, or `None` when unset or blank.
+fn non_blank(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// POST a prepared messages array to the configured `/chat/completions`
 /// endpoint.
 ///
@@ -493,10 +524,11 @@ async fn chat_with_key(
         model: config.model.clone(),
         messages,
         temperature: 0.3,
+        reasoning_effort: non_blank(&config.reasoning_effort),
+        service_tier: non_blank(&config.service_tier),
     };
 
-    let client = reqwest::Client::new();
-    let response = client
+    let response = http_client()
         .post(&config.api_url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
@@ -550,6 +582,8 @@ mod tests {
             api_key: "local-key".into(),
             model: "local-model".into(),
             api_url: url,
+            reasoning_effort: None,
+            service_tier: None,
         }
     }
 
@@ -657,6 +691,8 @@ mod tests {
                 ChatMessage::user("Hello".to_string()),
             ],
             temperature: 0.3,
+            reasoning_effort: None,
+            service_tier: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("gpt-4o-mini"));

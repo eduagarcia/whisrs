@@ -258,6 +258,15 @@ pub const FREE_TEXT: &[(&str, &str)] = &[
         "where your own sidecar listens",
     ),
     ("recording.summary_instruction", "rules in your own words"),
+    (
+        "hotkeys.double_tap",
+        "modifiers only, with no key the hotkey dialog could capture",
+    ),
+    (
+        "llm.reasoning_effort",
+        "a value your model's endpoint names",
+    ),
+    ("llm.service_tier", "a value your model's endpoint names"),
     ("hooks.on_record_start", "a shell command of your own"),
     ("hooks.on_record_stop", "a shell command of your own"),
     ("llm_commands.name", "a name you choose"),
@@ -774,6 +783,26 @@ const TYPING: &[Field] = &[
         "Window classes to treat as terminals, beside the built-in list. Matched whole, any \
          case.",
     ),
+    field(
+        "input.refocus",
+        "refocus",
+        Kind::Bool,
+        "Focus the window a dictation started in before its text is typed. Off, the text \
+         lands in whatever is focused when it is ready.",
+    ),
+    field(
+        "input.queue",
+        "queue",
+        Kind::Bool,
+        "Transcribe a stopped dictation in the background, so the next one can start at once; \
+         the texts are typed in order. Batch backends only.",
+    ),
+    field(
+        "input.trailing_space",
+        "trailing space",
+        Kind::Bool,
+        "Type a space after each batch dictation, so the next one does not run into it.",
+    ),
 ];
 
 const HOTKEYS: &[Field] = &[
@@ -803,6 +832,15 @@ const HOTKEYS: &[Field] = &[
         "next_profile",
         HOTKEY,
         "Switch to the next config profile: base, then the profiles by name.",
+    ),
+    field(
+        "hotkeys.double_tap",
+        "double_tap",
+        Kind::Text {
+            unset: Some("not set"),
+            check: None,
+        },
+        "Modifiers to tap together, such as Super+Alt: twice starts a dictation, once stops it.",
     ),
 ];
 
@@ -998,6 +1036,24 @@ const LLM: &[Field] = &[
             from: Source::List(catalog::LLM_URLS),
         },
         "The chat completions endpoint.",
+    ),
+    field(
+        "llm.reasoning_effort",
+        "reasoning_effort",
+        Kind::Text {
+            unset: Some("not sent"),
+            check: None,
+        },
+        "reasoning_effort sent with each request, such as low, for a reasoning model.",
+    ),
+    field(
+        "llm.service_tier",
+        "service_tier",
+        Kind::Text {
+            unset: Some("not sent"),
+            check: None,
+        },
+        "service_tier sent with each request; priority is OpenAI's fast tier.",
     ),
     field(
         "general.llm_post_process",
@@ -1473,6 +1529,9 @@ mod tests {
                 clipboard_fallback: true,
                 clipboard_only: true,
                 terminal_classes: vec!["kitty".into()],
+                refocus: true,
+                queue: true,
+                trailing_space: true,
             },
             deepgram: Some(DeepgramConfig {
                 api_key: "k".into(),
@@ -1515,6 +1574,8 @@ mod tests {
                 api_key: "k".into(),
                 model: "m".into(),
                 api_url: "u".into(),
+                reasoning_effort: some("low"),
+                service_tier: some("priority"),
             }),
             tts: Some(TtsConfig {
                 enabled: true,
@@ -1526,6 +1587,7 @@ mod tests {
                 url: some("u"),
             }),
             hotkeys: Some(HotkeyConfig {
+                double_tap: some("Super+Alt"),
                 toggle: some("a"),
                 cancel: some("b"),
                 command: some("c"),
@@ -1957,11 +2019,13 @@ mod tests {
     }
 
     /// Every hotkey, `[hotkeys]` and entries alike, is set in the hotkey
-    /// dialog.
+    /// dialog. `hotkeys.double_tap` is the exception: modifiers alone, which
+    /// the dialog (it waits for a trigger key) cannot capture, so it is typed.
     #[test]
     fn every_hotkey_row_uses_the_dialog() {
         for (path, field) in every_field() {
-            let hotkey = path.starts_with("hotkeys.") || path.ends_with("hotkey");
+            let hotkey = (path.starts_with("hotkeys.") && path != "hotkeys.double_tap")
+                || path.ends_with("hotkey");
             assert_eq!(hotkey, matches!(field.kind, Kind::Hotkey { .. }), "{path}");
         }
     }

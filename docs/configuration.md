@@ -70,6 +70,10 @@ whisrs listen for its own global hotkeys in `[hotkeys]`, `[[llm_commands]]` and 
   combo both fire, and whisrs warns at startup. Keys are
   [physical positions](troubleshooting.md#hotkey-keys-are-physical-positions-not-layout-characters),
   not the characters of your layout.
+- `[hotkeys] double_tap` takes modifiers alone, such as `"Super+Alt"`: tap them together
+  twice to start a dictation, and once to stop it. A tap is the modifiers pressed with no
+  other key and released within 0.8 s; the two taps must come within 0.6 s. Another key
+  pressed with them (`Super+Alt+Left`) is a shortcut, not a tap.
 
 ## Typing
 
@@ -88,6 +92,14 @@ virtual keyboard when the compositor has it, else uinput (`/dev/uinput`).
 - `clipboard_fallback = true` also leaves the text in the clipboard (only the untyped rest
   when a held modifier stopped the typing). `clipboard_only = true` copies and never types
   or pastes, whatever the two keys above say. `whisrs cancel` never copies anything.
+- `queue = true` (batch backends) sends a stopped dictation to the background: the daemon is
+  idle again at once, so the next dictation can start, and stop, while earlier ones are
+  still transcribed. The texts are injected in the order the dictations were stopped, and
+  the tray and pill show transcribing until the last one is in.
+- `refocus = false` leaves the focus alone: a batch dictation's text goes to whatever is
+  focused when it is ready, not to the window the dictation started in.
+- `trailing_space = true` follows each batch dictation with a space, so the next one does
+  not run into it.
 
 ## Terminal detection
 
@@ -131,7 +143,10 @@ sends nothing without a key, so give a local server any placeholder, such as
 - **`[general] llm_post_process = true`** runs every batch dictation through
   `llm_instruction`, a cleanup pass by default. If the LLM fails, times out (30 s) or
   returns nothing, the raw transcript is typed. `whisrs log` tags a rewritten one
-  `<backend>+llm`.
+  `<backend>+llm`. The LLM is given `[general] vocabulary` after the instruction, so a
+  term the backend mis-heard is written as listed.
+- **`[llm] reasoning_effort` and `service_tier`** are sent with every request when set, for
+  an endpoint that takes them (`reasoning_effort = "low"`, `service_tier = "priority"`).
 
 An entry's `set_hotkey` (or `whisrs llm-command-set <name>`) makes the selected text its new
 instruction, saved to the file and applied at once. Write an instruction that names the
@@ -215,8 +230,10 @@ api_key = "sk-or-..."   # or leave it out and set WHISRS_ASR_SIDECAR_API_KEY
 - No speech-to-text model is free, and OpenRouter picks the provider, so a request can
   cost more than the list price. `whisrs setup` and `whisrs config` list every model with
   its price, and `t` there checks the key without sending audio.
-- `[general] vocabulary` and `prompt` do nothing there: OpenRouter ignores `hotwords`, and
-  whisrs warns when one is set.
+- `[general] prompt` does nothing there: OpenRouter ignores `hotwords`, and whisrs warns
+  when it is set. `[general] vocabulary` reaches only `microsoft/mai-transcribe` models, as
+  a phrase list in OpenRouter's `provider` field; on any other model it is ignored, with
+  the same warning.
 
 Read-aloud reaches OpenRouter's voices through `tts-sidecar`:
 

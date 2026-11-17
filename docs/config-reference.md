@@ -113,6 +113,9 @@ Guide: [Terminal detection](configuration.md#terminal-detection).
 | `clipboard_fallback` | bool | `false` | `true`, `false` | Also leave the text in the clipboard, to paste if typing went wrong. |
 | `clipboard_only` | bool | `false` | `true`, `false` | Only copy the text to the clipboard, never type it. |
 | `terminal_classes` | list | none | strings | Window classes to treat as terminals, beside the built-in list. Matched whole, any case. |
+| `refocus` | bool | `true` | `true`, `false` | Focus the window a dictation started in before its text is typed. Off, the text lands in whatever is focused when it is ready. |
+| `queue` | bool | `false` | `true`, `false` | Transcribe a stopped dictation in the background, so the next one can start at once; the texts are typed in order. Batch backends only. |
+| `trailing_space` | bool | `false` | `true`, `false` | Type a space after each batch dictation, so the next one does not run into it. |
 
 ## [hotkeys]
 
@@ -126,6 +129,7 @@ Guide: [Hotkeys](configuration.md#hotkeys).
 | `speak` | hotkey | unset | a key combo ([syntax](configuration.md#hotkeys)) | Read the selection aloud ([tts]). |
 | `recording` | hotkey | unset | a key combo ([syntax](configuration.md#hotkeys)) | Start and stop a recording of mic and system audio. Needs the `recording` build feature. |
 | `next_profile` | hotkey | unset | a key combo ([syntax](configuration.md#hotkeys)) | Switch to the next config profile: base, then the profiles by name. |
+| `double_tap` | string | unset | text | Modifiers to tap together, such as Super+Alt: twice starts a dictation, once stops it. |
 
 ## [overlay]
 
@@ -201,6 +205,8 @@ Guide: [LLM commands](configuration.md#llm-commands).
 | `api_key` | API key | unset | your key | API key for the LLM provider: command mode, LLM commands, post-processing, recording summaries and speaker names. Unset, WHISRS_OPENAI_API_KEY is used, else WHISRS_GROQ_API_KEY. A local server that needs no key still needs a placeholder here. |
 | `model` | string | `gpt-4o-mini` | the provider's chat models | The chat model. Suggested for the OpenAI, Groq, OpenRouter, Gemini and Ollama URLs; any other name can be typed. |
 | `api_url` | string | `https://api.openai.com/v1/chat/completions` | `https://api.openai.com/v1/chat/completions`, `https://api.groq.com/openai/v1/chat/completions`, `https://openrouter.ai/api/v1/chat/completions`, `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`, `http://localhost:11434/v1/chat/completions`, or another URL | The chat completions endpoint. |
+| `reasoning_effort` | string | unset (not sent) | text | reasoning_effort sent with each request, such as low, for a reasoning model. |
+| `service_tier` | string | unset (not sent) | text | service_tier sent with each request; priority is OpenAI's fast tier. |
 
 ## [[llm_commands]]
 
