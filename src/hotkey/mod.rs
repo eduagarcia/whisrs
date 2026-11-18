@@ -547,6 +547,25 @@ impl KeyboardCache {
         held
     }
 
+    /// The lock keys as the cached keyboards show them (`EVIOCGLED`): a lock
+    /// is on when the LED of any keyboard that has one is lit. A compositor
+    /// keeps the LEDs in line with its own lock state, so this is that state
+    /// without asking the compositor. Keyboards without that LED, and ones
+    /// that cannot be read, say nothing: with none that does, both are off.
+    pub fn locks(&self) -> xkb_type::Locks {
+        use evdev::LedType;
+
+        let mut locks = xkb_type::Locks::default();
+        for device in self.nodes.values().flatten() {
+            let Ok(lit) = device.get_led_state() else {
+                continue;
+            };
+            locks.num |= lit.contains(LedType::LED_NUML);
+            locks.caps |= lit.contains(LedType::LED_CAPSL);
+        }
+        locks
+    }
+
     /// Number of cached keyboards (probed devices).
     pub fn keyboard_count(&self) -> usize {
         self.nodes.values().filter(|d| d.is_some()).count()
@@ -1096,6 +1115,22 @@ mod tests {
     }
 
     /// Unchanged nodes need no work: nothing reopened, nothing dropped.
+    /// On this machine: what [`KeyboardCache::locks`] reads from the real
+    /// keyboards. Ignored, since it needs `/dev/input` access and prints
+    /// rather than asserts: compare with the LEDs you see.
+    /// `cargo test --lib -- --ignored --nocapture locks_of_this_machine`.
+    #[test]
+    #[ignore = "reads the real keyboards in /dev/input"]
+    fn locks_of_this_machine() {
+        let mut cache = KeyboardCache::new(&[]);
+        cache.refresh().unwrap();
+        eprintln!(
+            "{} keyboard(s), locks: {:?}",
+            cache.keyboard_count(),
+            cache.locks()
+        );
+    }
+
     #[test]
     fn diff_nodes_is_empty_when_nothing_changed() {
         let cached = [node("/dev/input/event0", 1), node("/dev/input/event1", 2)];

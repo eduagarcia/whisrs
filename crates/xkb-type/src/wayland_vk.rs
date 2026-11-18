@@ -211,6 +211,37 @@ const CTRL_XKB_KEYCODE: u32 = 37;
 /// client would see a bare key press instead of a Ctrl-chord.
 const CTRL_MOD_MASK: u32 = 1 << 2;
 
+/// Modifier **mask** of Num Lock in the *locked* modifiers.
+///
+/// Our keymap binds `modifier_map Mod2 { <K77> }` to a `Num_Lock` key, as
+/// stock layouts do, so Num Lock is `Mod2` at index 4. Asserted in
+/// `lock_masks_light_their_indicators`.
+///
+/// # Why the virtual keyboard carries the locks
+///
+/// The virtual keyboard is a keyboard of its own for the compositor, with its
+/// own modifier state, and `zwp_virtual_keyboard_v1.modifiers` sets all of
+/// it: depressed, latched and *locked*. Sending `locked = 0` with a Ctrl+V
+/// says "Num Lock is off". The focused window then reads the numeric keypad
+/// as arrows until a physical modifier key is pressed, and a compositor that
+/// keeps the LEDs of all keyboards alike (Hyprland) turns the Num Lock LED of
+/// the real keyboard off while that keyboard still has Num Lock on, so it
+/// takes two presses to light it again. So the locks of the user's keyboard
+/// ([`KeyInjector::set_locks`]) go into every `modifiers` request, and the
+/// keymap has the two lock keys for the compositor to derive the LEDs from.
+const NUM_LOCK_MOD_MASK: u32 = 1 << 4;
+
+/// Modifier **mask** of Caps Lock in the locked modifiers: `Lock`, index 1
+/// (`modifier_map Lock { <K66> }`). Sent with combos only, see
+/// [`WaylandVkKeyboard::locked_mask`].
+const CAPS_LOCK_MOD_MASK: u32 = 1 << 1;
+
+/// XKB keycode of the Num Lock key: `KEY_NUMLOCK` (evdev 69) + 8.
+const NUM_LOCK_XKB_KEYCODE: u32 = 77;
+
+/// XKB keycode of the Caps Lock key: `KEY_CAPSLOCK` (evdev 58) + 8.
+const CAPS_LOCK_XKB_KEYCODE: u32 = 66;
+
 /// The XKB level reached by a per-character key tap, encoding which modifier
 /// (if any) must be held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,6 +502,11 @@ fn base_keys() -> Vec<BaseKey> {
         // instead of being silently dropped (matches the uinput backend).
         (Key::KEY_ENTER, "Return"),
         (Key::KEY_TAB, "Tab"),
+        // Never pressed: they give the keymap its Num Lock and Caps Lock
+        // modifiers and LEDs, so the locks sent with `modifiers` mean there
+        // what they mean on the user's keyboard ([`NUM_LOCK_MOD_MASK`]).
+        (Key::KEY_NUMLOCK, "Num_Lock"),
+        (Key::KEY_CAPSLOCK, "Caps_Lock"),
     ];
     entries
         .iter()
@@ -600,6 +636,15 @@ pub(crate) fn build_keymap_string(chars: &[char]) -> (String, HashMap<char, Char
     // `send_combo` register as real Control-held state, not a bare keycode.
     keymap.push_str(&format!(
         "modifier_map Control {{ <K{CTRL_XKB_KEYCODE}> }};\n"
+    ));
+    // Bind the lock keys, so the locked modifiers sent with each
+    // `modifiers` request are Num Lock and Caps Lock in this keymap too, and
+    // its "Num Lock" and "Caps Lock" indicators follow them.
+    keymap.push_str(&format!(
+        "modifier_map Mod2 {{ <K{NUM_LOCK_XKB_KEYCODE}> }};\n"
+    ));
+    keymap.push_str(&format!(
+        "modifier_map Lock {{ <K{CAPS_LOCK_XKB_KEYCODE}> }};\n"
     ));
     // Permanent ASCII keys, each FOUR_LEVEL with an optional dynamic level-2.
     for &(kc, l0, l1) in PERMANENT_ASCII_KEYS {
@@ -785,6 +830,9 @@ pub struct WaylandVkKeyboard {
     /// protocol only requires a consistent clock with millisecond
     /// granularity and an undefined base, so a simple counter suffices.
     time: u32,
+    /// The lock keys of the user's keyboard ([`KeyInjector::set_locks`]),
+    /// sent as the locked modifiers of every `modifiers` request.
+    locks: crate::Locks,
 }
 
 impl WaylandVkKeyboard {
@@ -837,6 +885,7 @@ impl WaylandVkKeyboard {
             keymap_uploaded: false,
             key_delay,
             time: 0,
+            locks: crate::Locks::default(),
         })
     }
 
@@ -916,21 +965,39 @@ impl WaylandVkKeyboard {
             Level::Shift => SHIFT_MOD_MASK,
             Level::AltGr => ALTGR_MOD_MASK,
         };
+        let locked = self.locked_mask(/* combo = */ false);
         if mask != 0 {
-            self.set_modifiers(mask)?;
+            self.set_modifiers(mask, locked)?;
         }
         self.tap_keycode(key.keycode)?;
         if mask != 0 {
-            self.set_modifiers(0)?;
+            self.set_modifiers(0, locked)?;
         }
         Ok(())
     }
 
-    /// Declare the depressed-modifier mask via `zwp_virtual_keyboard_v1.modifiers`
-    /// (latched/locked = 0, group 0), then flush and sleep `key_delay` so the
-    /// compositor applies it before the next key event.
-    fn set_modifiers(&mut self, depressed: u32) -> anyhow::Result<()> {
-        self.vk.modifiers(depressed, 0, 0, 0);
+    /// The locked modifiers to send: the locks of the user's keyboard
+    /// ([`NUM_LOCK_MOD_MASK`] says why). Num Lock always. Caps Lock only with
+    /// a `combo`: while text is typed it would capitalize it, because a
+    /// client applies Caps Lock to the letters of our keymap as to any
+    /// other, and dictated text must come out as it was heard.
+    fn locked_mask(&self, combo: bool) -> u32 {
+        let mut locked = 0;
+        if self.locks.num {
+            locked |= NUM_LOCK_MOD_MASK;
+        }
+        if combo && self.locks.caps {
+            locked |= CAPS_LOCK_MOD_MASK;
+        }
+        locked
+    }
+
+    /// Declare the depressed and the locked modifier masks via
+    /// `zwp_virtual_keyboard_v1.modifiers` (latched = 0, group 0), then flush
+    /// and sleep `key_delay` so the compositor applies it before the next key
+    /// event.
+    fn set_modifiers(&mut self, depressed: u32, locked: u32) -> anyhow::Result<()> {
+        self.vk.modifiers(depressed, 0, locked, 0);
         self.conn.flush().context("flush after modifiers")?;
         std::thread::sleep(self.key_delay);
         Ok(())
@@ -1187,8 +1254,9 @@ impl KeyInjector for WaylandVkKeyboard {
             }
         }
 
+        let locked = self.locked_mask(/* combo = */ true);
         if mask != 0 {
-            self.set_modifiers(mask)?;
+            self.set_modifiers(mask, locked)?;
         }
 
         // Press the non-modifier keys (evdev code + 8) in order, release in
@@ -1203,7 +1271,7 @@ impl KeyInjector for WaylandVkKeyboard {
         }
 
         if mask != 0 {
-            self.set_modifiers(0)?;
+            self.set_modifiers(0, locked)?;
         }
 
         Ok(())
@@ -1211,6 +1279,10 @@ impl KeyInjector for WaylandVkKeyboard {
 
     fn set_key_delay(&mut self, delay: Duration) {
         self.key_delay = delay;
+    }
+
+    fn set_locks(&mut self, locks: crate::Locks) {
+        self.locks = locks;
     }
 }
 
@@ -1249,6 +1321,64 @@ fn create_keymap_fd(bytes: &[u8]) -> anyhow::Result<std::os::fd::OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The locked masks we send are Num Lock and Caps Lock in our keymap: each
+    /// lights its indicator there (what a compositor derives the keyboard LEDs
+    /// from), sits at the index its mask assumes, and Num Lock changes no
+    /// character we type.
+    #[test]
+    fn lock_masks_light_their_indicators() {
+        let (keymap_str, map) = build_keymap_string(&['é']);
+        let keymap = compile(&keymap_str);
+        assert_eq!(
+            keymap.mod_get_index("Mod2"),
+            NUM_LOCK_MOD_MASK.trailing_zeros()
+        );
+        assert_eq!(
+            keymap.mod_get_index("Lock"),
+            CAPS_LOCK_MOD_MASK.trailing_zeros()
+        );
+
+        let mut state = xkb::State::new(&keymap);
+        assert!(!state.led_name_is_active(xkb::LED_NAME_NUM));
+        assert!(!state.led_name_is_active(xkb::LED_NAME_CAPS));
+
+        state.update_mask(0, 0, NUM_LOCK_MOD_MASK, 0, 0, 0);
+        assert!(state.led_name_is_active(xkb::LED_NAME_NUM));
+        assert!(!state.led_name_is_active(xkb::LED_NAME_CAPS));
+        // Typed text is the same with Num Lock on: base, Shift and AltGr.
+        for (ch, depressed) in [('a', 0), ('A', SHIFT_MOD_MASK), ('é', ALTGR_MOD_MASK)] {
+            state.update_mask(depressed, 0, NUM_LOCK_MOD_MASK, 0, 0, 0);
+            let keycode = xkb::Keycode::new(map[&ch].keycode);
+            assert_eq!(state.key_get_utf8(keycode), ch.to_string());
+        }
+
+        state.update_mask(
+            CTRL_MOD_MASK,
+            0,
+            NUM_LOCK_MOD_MASK | CAPS_LOCK_MOD_MASK,
+            0,
+            0,
+            0,
+        );
+        assert!(state.led_name_is_active(xkb::LED_NAME_NUM));
+        assert!(state.led_name_is_active(xkb::LED_NAME_CAPS));
+    }
+
+    /// On a real Wayland session: a lone Shift from the virtual keyboard, with
+    /// Num Lock told on or off by `WHISRS_VK_NUM` (`1`, the default, or `0`).
+    /// Look at the compositor's view and the keyboard's LED afterwards
+    /// (`hyprctl devices -j`): with `1` Num Lock stays on, with `0` it shows
+    /// the bug the locks fix. Ignored: it sends a key to the focused window.
+    #[test]
+    #[ignore = "sends a Shift tap to the focused window of a Wayland session"]
+    fn lone_shift_on_a_wayland_session() {
+        let num = std::env::var("WHISRS_VK_NUM").map_or(true, |v| v != "0");
+        let mut keyboard = WaylandVkKeyboard::new(Duration::from_millis(5)).unwrap();
+        keyboard.set_locks(crate::Locks { num, caps: false });
+        keyboard.send_combo(&[evdev::Key::KEY_LEFTSHIFT]).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    }
 
     /// Compile a keymap string into an `xkb::Keymap`, panicking with the source
     /// on failure (the source is invaluable when an xkb syntax error slips in).

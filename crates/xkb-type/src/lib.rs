@@ -168,6 +168,20 @@ pub trait KeyInjector: Send {
 
     /// Set the inter-event delay used between injected key events.
     fn set_key_delay(&mut self, delay: std::time::Duration);
+
+    /// Tell the injector which lock keys are on, on the user's own keyboard.
+    /// A backend whose device has a modifier state of its own (the Wayland
+    /// virtual keyboard) carries them in it, so its keystrokes do not tell
+    /// the compositor and the focused window that Num Lock went off. The
+    /// default does nothing: a kernel device (uinput) has no such state.
+    fn set_locks(&mut self, _locks: Locks) {}
+}
+
+/// The lock keys of the user's keyboard, see [`KeyInjector::set_locks`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Locks {
+    pub num: bool,
+    pub caps: bool,
 }
 
 impl KeyInjector for Keyboard {

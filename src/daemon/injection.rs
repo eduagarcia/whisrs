@@ -622,6 +622,10 @@ fn with_persistent_keyboard<T>(
         .as_mut()
         .expect("keyboard exists after initialization");
     keyboard.set_key_delay(key_delay);
+    // After the probe above refreshed the keyboard cache: the virtual
+    // keyboard must say Num Lock is on when it is, or each paste turns it
+    // off for the focused window and the keyboard's LED.
+    keyboard.set_locks(physical_locks());
 
     let mut gate = |_next: usize| {
         if policy.wait(&mut probe).lets_keys_through() {
@@ -825,6 +829,29 @@ fn modifier_probe() -> impl FnMut() -> bool {
             .lock()
             .is_ok_and(|mut cache| cache.any_modifier_held())
     }
+}
+
+/// The lock keys of the physical keyboards, from the cache [`modifier_probe`]
+/// keeps (their LEDs, see [`whisrs::hotkey::KeyboardCache::locks`]). Both off
+/// without `/dev/input` access, which is what the keystrokes said before.
+#[cfg(not(test))]
+fn physical_locks() -> xkb_type::Locks {
+    keyboard_cache()
+        .lock()
+        .map(|cache| cache.locks())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for [`physical_locks`]: tests must never read `/dev/input`.
+    static PHYSICAL_LOCKS: std::cell::Cell<xkb_type::Locks> =
+        const { std::cell::Cell::new(xkb_type::Locks { num: false, caps: false }) };
+}
+
+#[cfg(test)]
+fn physical_locks() -> xkb_type::Locks {
+    PHYSICAL_LOCKS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2045,6 +2072,8 @@ mod tests {
         paste_combos: Arc<StdMutex<usize>>,
         /// The keys of every combo, in order.
         combos: Arc<StdMutex<Vec<Vec<evdev::Key>>>>,
+        /// Every `set_locks` call, in order.
+        locks: Arc<StdMutex<Vec<xkb_type::Locks>>>,
         events: Arc<StdMutex<Vec<&'static str>>>,
         fail_typing: bool,
     }
@@ -2087,6 +2116,10 @@ mod tests {
         }
 
         fn set_key_delay(&mut self, _delay: std::time::Duration) {}
+
+        fn set_locks(&mut self, locks: xkb_type::Locks) {
+            self.locks.lock().unwrap().push(locks);
+        }
     }
 
     /// Run `f` with `keyboard` installed as the persistent virtual keyboard,
@@ -2264,6 +2297,32 @@ mod tests {
             *clipboard.restored.lock().unwrap(),
             vec![ImageClipboard::image()]
         );
+    }
+
+    /// Every injection hands the keyboard the lock keys of the physical
+    /// keyboards before its first key: a virtual keyboard that says "Num Lock
+    /// off" with each Ctrl+V turned it off for the window and the LED.
+    #[test]
+    fn the_keyboard_is_told_the_physical_locks_before_a_paste() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let num_on = xkb_type::Locks {
+            num: true,
+            caps: false,
+        };
+        PHYSICAL_LOCKS.with(|locks| locks.set(num_on));
+        let clipboard = Arc::new(ScriptedClipboard::new(&[Some("original"), Some("texto")]));
+        let keyboard = MockKeyboard::default();
+        let (locks, events) = (Arc::clone(&keyboard.locks), Arc::clone(&keyboard.events));
+
+        let result = inject(
+            keyboard, clipboard, "texto", /* paste = */ true,
+            /* clipboard_fallback = */ false, /* clipboard_only = */ false,
+        );
+        PHYSICAL_LOCKS.with(|locks| locks.set(xkb_type::Locks::default()));
+
+        assert_eq!(result.unwrap(), Injection::Delivered);
+        assert_eq!(*locks.lock().unwrap(), vec![num_on]);
+        assert_eq!(*events.lock().unwrap(), vec!["combo"]);
     }
 
     #[test]
