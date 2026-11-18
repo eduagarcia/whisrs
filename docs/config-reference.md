@@ -16,6 +16,7 @@ Guide: [Batch and streaming backends](configuration.md#batch-and-streaming-backe
 | `silence_timeout_ms` | integer (ms) | `2000` | 0 to 600000; `0` = off | Stop after this much silence once you spoke: streaming dictation, command mode, LLM commands and agent turns. Batch dictation stops on a second press. At 0 (off), every session waits for the second press. |
 | `notify` | bool | `true` | `true`, `false` | Desktop notifications for dictation and errors. |
 | `history` | bool | `true` | `true`, `false` | Keep finished dictations for whisrs log. Off stops new entries; whisrs log --clear removes the old ones. |
+| `archive_dir` | string | unset (nothing kept) | text | Keep each batch dictation's audio, the backend's and the LLM's responses and their cost in this folder. Written locally first, so a share that is down holds nothing up. |
 | `audio_feedback` | bool | `false` | `true`, `false` | Tones when dictation starts, stops and is done. |
 | `audio_feedback_volume` | number | `0.5` | 0 to 1 | Volume of the tones. |
 | `tray` | bool | `true` | `true`, `false` | Show the tray icon. It needs a StatusNotifierItem tray host, such as waybar's tray module, KDE Plasma, or GNOME with the AppIndicator extension. Needs the `tray` build feature. |

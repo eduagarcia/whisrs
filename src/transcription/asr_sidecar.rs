@@ -248,6 +248,7 @@ impl AsrSidecarBackend {
         // network that went down times out or finds no route: a recording
         // waits those out. One that took the request and then closed the
         // connection crashed on it, which is final (`final_if_crashed`).
+        let sent_at = std::time::Instant::now();
         let response = request
             .multipart(form)
             .send()
@@ -280,6 +281,9 @@ impl AsrSidecarBackend {
             }
             return Err(super::http_error(code, retry_after, message));
         }
+        // For the dictation archive: the body carries the provider's usage
+        // and cost, which the parsed transcript drops.
+        crate::capture::asr_response(&body, sent_at.elapsed());
         Ok(body)
     }
 

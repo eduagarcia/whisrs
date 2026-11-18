@@ -385,6 +385,25 @@ vocabulary` (config.toml's terms first, duplicates dropped). A missing file is i
 When the file exists, `whisrs config` shows the merged list and writes a changed one to
 `vocabulary.txt` whole (comments dropped), with an empty `vocabulary` in config.toml.
 
+## The dictation archive
+
+`[general] archive_dir = "/path/to/folder"` keeps every batch dictation the backend answered,
+as material to compare backends with later:
+
+- `YYYY-MM/<UTC time>_<id>.wav`: the audio, 16 kHz mono.
+- `YYYY-MM/<UTC time>_<id>.json`: the transcription backend's response and the LLM's, each
+  whole as it came, how long each took, the transcript, the text that was typed, and the
+  cost.
+- `costs.jsonl`, at the top: one line per dictation with the audio seconds and the charge
+  the transcription provider reported, and the LLM's token counts (and its charge, when the
+  endpoint reports one).
+
+The folder can be a network share. Each dictation is written to
+`~/.local/share/whisrs/archive-spool/` first and moved to the folder by a thread of its own,
+so a share that is down never delays a dictation: the spool is emptied when the folder
+answers again, at the next dictation or the next start. The folder must exist; whisrs does
+not create it, since a share that is not mounted leaves an empty mount point.
+
 ## Word replacements
 
 `vocabulary` only hints the model. When it still mis-hears a term the same way every time,

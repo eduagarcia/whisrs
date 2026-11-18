@@ -6,12 +6,12 @@
    │   Audio                 ┃ ▌ de  German                                        ┃  │
    │   Vocabulary            ┃   use "ger"                                         ┃  │
    │   Replacements          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  │
-   │   Typing                  feedback volume  ▰▰▰▰▰▱▱▱▱▱ 50%                        │
-   │   Hotkeys                 tray icon        on                                    │
-   │   Overlay                                                                        │
-   │   Read aloud (TTS)        The language you dictate in, or auto. whisrs toggle    │
-   │   Agents                  -l overrides it for one dictation. en: English.        │
-   │   LLM                                                                            │
+   │   Typing                  audio feedback   off                                   │
+   │   Hotkeys                 feedback volume  ▰▰▰▰▰▱▱▱▱▱ 50%                        │
+   │   Overlay                 tray icon        on                                    │
+   │   Read aloud (TTS)                                                               │
+   │   Agents                  The language you dictate in, or auto. whisrs toggle    │
+   │   LLM                     -l overrides it for one dictation. en: English.        │
    │   LLM commands                                                                   │
    │   Recording                                                                      │
    │   Hooks                                                                          │

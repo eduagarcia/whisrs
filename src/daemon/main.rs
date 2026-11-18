@@ -12,6 +12,7 @@ use whisrs::window::{self, WindowTracker};
 use whisrs::{encode_message, read_message, socket_path, Command, DaemonInfo, Response};
 
 mod agent;
+mod archive;
 mod command_mode;
 mod context;
 mod dictation;
@@ -181,6 +182,12 @@ async fn main() -> Result<()> {
     });
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
+
+    // Dictations an earlier run could not move to `[general] archive_dir`
+    // (the share was down) go there now, off this thread.
+    if let Some(dir) = archive::archive_dir(context.config.general.archive_dir.as_deref()) {
+        archive::flush_in_background(dir);
+    }
 
     // Shared command channel for in-process command sources (hotkeys, tray
     // menu). One dispatch loop drains it and routes every command through

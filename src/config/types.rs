@@ -665,6 +665,16 @@ pub struct GeneralConfig {
     /// sensible; blank means "post-process nothing" (and is warned about).
     #[serde(default = "default_llm_instruction")]
     pub llm_instruction: String,
+    /// Keep every batch dictation in this folder: its audio (WAV), the
+    /// transcription backend's response and the LLM's as they came, the
+    /// texts, and what each call cost (also one line in `costs.jsonl`).
+    /// Each dictation is written to a spool on the local disk first and
+    /// copied here in the background, so a folder that is unreachable (a
+    /// network share that is down) never holds a dictation up: the spool
+    /// is emptied the next time the folder answers. The folder itself must
+    /// exist; unset keeps nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_dir: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -685,6 +695,7 @@ impl Default for GeneralConfig {
             overlay: false,
             llm_post_process: false,
             llm_instruction: default_llm_instruction(),
+            archive_dir: None,
         }
     }
 }

@@ -528,6 +528,7 @@ async fn chat_with_key(
         service_tier: non_blank(&config.service_tier),
     };
 
+    let sent_at = std::time::Instant::now();
     let response = http_client()
         .post(&config.api_url)
         .header("Authorization", format!("Bearer {api_key}"))
@@ -550,11 +551,15 @@ async fn chat_with_key(
         anyhow::bail!("LLM API error ({status}): {detail}");
     }
 
-    let chat_response: ChatResponse = response
-        .json()
+    let body = response
+        .text()
         .await
         .map_err(reqwest::Error::without_url)
-        .context("failed to parse LLM response")?;
+        .context("failed to read the LLM response")?;
+    // For the dictation archive: the body carries the usage the reply drops.
+    crate::capture::llm_response(&body, sent_at.elapsed());
+    let chat_response: ChatResponse =
+        serde_json::from_str(&body).context("failed to parse LLM response")?;
 
     let reply = chat_response
         .choices

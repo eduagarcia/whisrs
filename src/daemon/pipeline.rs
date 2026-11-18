@@ -1370,23 +1370,55 @@ pub(crate) async fn transcribe_recording_batch(
 
     info!("collected {} audio samples", samples.len());
 
-    let text =
-        transcribe_batch_audio(&samples, context, language, &BatchOptions::dictation()).await?;
+    // Inside a capture scope, so the dictation archive (`[general]
+    // archive_dir`) gets what the backend and the LLM answered.
+    let (result, captured) = whisrs::capture::scope(async {
+        let transcript =
+            transcribe_batch_audio(&samples, context, language, &BatchOptions::dictation()).await?;
 
-    if text.is_empty() {
-        // Gated, echo-dropped, or empty — the helper already said so.
-        return Ok(DictationOutcome::raw(text));
+        if transcript.is_empty() {
+            // Gated, echo-dropped, or empty — the helper already said so.
+            return Ok((String::new(), DictationOutcome::raw(transcript)));
+        }
+
+        // `[general] llm_post_process`: rewrite the finished transcript through
+        // the shared `[llm]` backend before it reaches the cursor (issue #85).
+        // Batch-only by design — the streaming pipeline types partials as they
+        // arrive and never holds a whole transcript, so this must NOT be wired
+        // into `run_streaming_pipeline`; the usual "wire it into both paths" rule
+        // is inverted here and `Config::validate` warns instead. The rewritten
+        // text is what this function returns, so history records what was actually
+        // typed, tagged by `history_backend_tag` with whether the LLM produced it.
+        let outcome = apply_llm_post_process(transcript.clone(), context).await;
+        anyhow::Ok((transcript, outcome))
+    })
+    .await;
+    let (transcript, outcome) = result?;
+
+    // Only a dictation the backend answered: a gated one never reached it.
+    let config = &context.config;
+    if let (Some(dir), true) = (
+        crate::archive::archive_dir(config.general.archive_dir.as_deref()),
+        captured.asr.is_some(),
+    ) {
+        crate::archive::archive(
+            dir,
+            crate::archive::Dictation {
+                samples,
+                language: language.to_string(),
+                backend: config.general.backend.clone(),
+                asr_model: get_model_for_backend(config),
+                llm_model: llm_post_process_instruction(config)
+                    .map(|_| config.llm.clone().unwrap_or_default().model),
+                captured,
+                transcript,
+                text: outcome.text.clone(),
+                post_processed: outcome.post_processed,
+            },
+        );
     }
 
-    // `[general] llm_post_process`: rewrite the finished transcript through
-    // the shared `[llm]` backend before it reaches the cursor (issue #85).
-    // Batch-only by design — the streaming pipeline types partials as they
-    // arrive and never holds a whole transcript, so this must NOT be wired
-    // into `run_streaming_pipeline`; the usual "wire it into both paths" rule
-    // is inverted here and `Config::validate` warns instead. The rewritten
-    // text is what this function returns, so history records what was actually
-    // typed, tagged by `history_backend_tag` with whether the LLM produced it.
-    Ok(apply_llm_post_process(text, context).await)
+    Ok(outcome)
 }
 
 /// The second half of [`process_recording_batch`]: put a finished dictation

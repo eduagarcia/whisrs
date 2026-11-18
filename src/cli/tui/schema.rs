@@ -267,6 +267,7 @@ pub const FREE_TEXT: &[(&str, &str)] = &[
         "a value your model's endpoint names",
     ),
     ("llm.service_tier", "a value your model's endpoint names"),
+    ("general.archive_dir", "a folder of your own"),
     ("hooks.on_record_start", "a shell command of your own"),
     ("hooks.on_record_stop", "a shell command of your own"),
     ("llm_commands.name", "a name you choose"),
@@ -488,6 +489,16 @@ const GENERAL: &[Field] = &[
         Kind::Bool,
         "Keep finished dictations for whisrs log. Off stops new entries; whisrs log --clear \
          removes the old ones.",
+    ),
+    field(
+        "general.archive_dir",
+        "archive folder",
+        Kind::Text {
+            unset: Some("nothing kept"),
+            check: None,
+        },
+        "Keep each batch dictation's audio, the backend's and the LLM's responses and their \
+         cost in this folder. Written locally first, so a share that is down holds nothing up.",
     ),
     field(
         "general.audio_feedback",
@@ -1516,6 +1527,7 @@ mod tests {
                 overlay: true,
                 llm_post_process: true,
                 llm_instruction: "i".into(),
+                archive_dir: some("/tmp/archive"),
             },
             audio: AudioConfig {
                 device: "default".into(),
