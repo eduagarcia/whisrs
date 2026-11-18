@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=whisrs
+GenericName=Ditado por voz
+Comment=Configure whisrs, veja o histórico de ditados e transcreva de novo os que falharam
+Exec=whisrs-ui
+Icon=whisrs-ui
+Terminal=false
+Categories=Utility;Settings;AudioVideo;
+Keywords=dictation;voice;whisrs;ditado;transcrição;
+StartupWMClass=whisrs-ui

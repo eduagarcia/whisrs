@@ -554,6 +554,14 @@ const GENERAL: &[Field] = &[
          module, KDE Plasma, or GNOME with the AppIndicator extension.",
         Gate::Tray,
     ),
+    gated(
+        "general.tray_click",
+        "tray click",
+        Kind::Choice(catalog::TRAY_CLICKS),
+        "What a left click on the tray icon does: toggle a dictation, or open the whisrs window \
+         (whisrs-ui, when it is installed).",
+        Gate::Tray,
+    ),
 ];
 
 const BACKEND: &[Field] = &[
@@ -1559,6 +1567,7 @@ mod tests {
                 vocabulary: vec!["whisrs".into()],
                 prompt: some("p"),
                 tray: true,
+                tray_click: "window".into(),
                 overlay: true,
                 llm_post_process: true,
                 llm_instruction: "i".into(),

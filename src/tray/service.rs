@@ -196,6 +196,48 @@ struct WhisrsTray {
     profiles: ProfileMenu,
     /// The daemon's restart, for "Restart Daemon".
     restart: RestartFn,
+    /// The whisrs window's program ([`window_program`]), when installed.
+    window: Option<std::path::PathBuf>,
+    /// `[general] tray_click = "window"`: a left click opens the window.
+    click_opens_window: bool,
+}
+
+/// The program of the whisrs window: `whisrs-ui` beside the running binary
+/// (both live in `~/.local/bin` once installed), else on the `PATH`.
+pub fn window_program() -> Option<std::path::PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("whisrs-ui")));
+    if let Some(path) = beside.filter(|p| p.is_file()) {
+        return Some(path);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("whisrs-ui"))
+            .find(|p| p.is_file())
+    })
+}
+
+/// Start the whisrs window. It brings an open one forward itself, so a
+/// second click never opens a second window. The child is reaped on a
+/// thread of its own; the tray never waits for it.
+fn open_window(program: &std::path::Path) {
+    match std::process::Command::new(program)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => warn!(
+            "tray: cannot open the whisrs window ({}): {e}",
+            program.display()
+        ),
+    }
 }
 
 impl WhisrsTray {
@@ -233,8 +275,14 @@ impl ksni::Tray for WhisrsTray {
         format!("whisrs: {}", state_word(self.state.current))
     }
 
-    /// Left-click on the icon: toggle recording, same as `whisrs toggle`.
+    /// Left-click on the icon: toggle recording, same as `whisrs toggle`, or
+    /// open the whisrs window under `[general] tray_click = "window"`.
     fn activate(&mut self, _x: i32, _y: i32) {
+        if let (true, Some(window)) = (self.click_opens_window, &self.window) {
+            debug!("tray activated (left-click): open the window");
+            open_window(window);
+            return;
+        }
         debug!("tray activated (left-click): toggle");
         self.send(Command::Toggle { language: None });
     }
@@ -307,6 +355,20 @@ impl ksni::Tray for WhisrsTray {
             }),
             MenuItem::Separator,
         ];
+        if self.window.is_some() {
+            items.extend([
+                MenuItem::Standard(StandardItem {
+                    label: "Open whisrs window".to_string(),
+                    activate: Box::new(|tray: &mut Self| {
+                        if let Some(window) = &tray.window {
+                            open_window(window);
+                        }
+                    }),
+                    ..Default::default()
+                }),
+                MenuItem::Separator,
+            ]);
+        }
         #[cfg(feature = "recording")]
         {
             items.extend(recording_menu_items(&self.state.recording));
@@ -477,7 +539,12 @@ pub async fn spawn_tray(
     notify: Option<NotifyFn>,
     profiles: ProfileMenu,
     restart: RestartFn,
+    click_opens_window: bool,
 ) {
+    let window = window_program();
+    if click_opens_window && window.is_none() {
+        warn!("tray: tray_click = \"window\" but whisrs-ui is not installed; a click toggles");
+    }
     // Retry spawning the tray with exponential backoff.
     let mut delay = TRAY_INITIAL_DELAY;
     let mut handle = None;
@@ -493,6 +560,8 @@ pub async fn spawn_tray(
             notify,
             profiles: profiles.clone(),
             restart: std::sync::Arc::clone(&restart),
+            window: window.clone(),
+            click_opens_window,
         };
 
         match tray.spawn().await {
@@ -605,7 +674,47 @@ mod tests {
             notify: None,
             profiles: ProfileMenu::default(),
             restart: std::sync::Arc::new(|_| panic!("a tray test restarted the daemon")),
+            window: None,
+            click_opens_window: false,
         }
+    }
+
+    /// The window item is in the menu only when whisrs-ui was found, and a
+    /// left click opens it only under `tray_click = "window"`; otherwise, or
+    /// without the program, the click toggles as before.
+    #[test]
+    fn the_window_item_and_the_click_follow_the_setting() {
+        let menu_labels = |tray: &WhisrsTray| -> Vec<String> {
+            tray.menu()
+                .iter()
+                .filter_map(|i| match i {
+                    MenuItem::Standard(s) => Some(s.label.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut tray = tray_with(tx, State::Idle);
+        assert!(!menu_labels(&tray).contains(&"Open whisrs window".to_string()));
+
+        // Asked for the window, but none installed: the click toggles.
+        tray.click_opens_window = true;
+        tray.activate(0, 0);
+        assert!(matches!(rx.try_recv(), Ok(Command::Toggle { .. })));
+
+        // Installed (a harmless program here): menu item, and no toggle.
+        tray.window = Some(std::path::PathBuf::from("/bin/true"));
+        assert!(menu_labels(&tray).contains(&"Open whisrs window".to_string()));
+        tray.activate(0, 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "the click opened the window instead"
+        );
+
+        // Installed but the click is left on toggle.
+        tray.click_opens_window = false;
+        tray.activate(0, 0);
+        assert!(matches!(rx.try_recv(), Ok(Command::Toggle { .. })));
     }
 
     /// Dictation's words in the title, the menu's status line and the

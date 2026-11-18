@@ -189,6 +189,15 @@ pub const SEGMENTATIONS: &[Entry] = &[
     ("none", "types everything when you stop"),
 ];
 
+/// `[general] tray_click`: what a left click on the tray icon does.
+pub const TRAY_CLICKS: &[Entry] = &[
+    ("toggle", "starts or stops a dictation"),
+    (
+        "window",
+        "opens the whisrs window (whisrs-ui), when it is installed",
+    ),
+];
+
 /// `[openai-compatible-realtime] profile`: the server's dialect.
 pub const REALTIME_PROFILES: &[Entry] = &[
     ("lemonade", "Lemonade: 16 kHz, interim text replaced"),
@@ -1396,6 +1405,7 @@ mod tests {
             RECORDING_BACKENDS,
             LIVE_ONLY_BACKENDS,
             SEGMENTATIONS,
+            TRAY_CLICKS,
             REALTIME_PROFILES,
             TURN_DETECTIONS,
             INPUT_BACKENDS,

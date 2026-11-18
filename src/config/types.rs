@@ -640,6 +640,13 @@ pub struct GeneralConfig {
     /// Enable system tray icon.
     #[serde(default = "default_true")]
     pub tray: bool,
+    /// What a left click on the tray icon does: `"toggle"` starts or stops
+    /// a dictation, `"window"` opens the whisrs window (the `whisrs-ui`
+    /// program beside the whisrs binaries or on the PATH; without it the
+    /// click toggles). The right-click menu has an "Open whisrs window" item
+    /// either way when the program is there.
+    #[serde(default = "default_tray_click")]
+    pub tray_click: String,
     /// Enable the on-screen recording overlay.
     #[serde(default)]
     pub overlay: bool,
@@ -707,6 +714,7 @@ impl Default for GeneralConfig {
             vocabulary: Vec::new(),
             prompt: None,
             tray: true,
+            tray_click: default_tray_click(),
             overlay: false,
             llm_post_process: false,
             llm_instruction: default_llm_instruction(),
@@ -1289,6 +1297,9 @@ fn default_silence_timeout() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_tray_click() -> String {
+    "toggle".to_string()
 }
 fn default_device() -> String {
     "default".to_string()

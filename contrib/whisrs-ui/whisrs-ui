@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Open the whisrs window (or bring an open one forward).
+# Install: link this file into ~/.local/bin (setup creates the venv on first run).
+set -euo pipefail
+DIR="$(dirname "$(readlink -f "$0")")"
+UV="$(command -v uv || true)"
+[ -n "$UV" ] || UV="$HOME/.local/bin/uv"
+# The window needs the system's GTK and WebKit bindings (python-gobject,
+# webkit2gtk-4.1), so the venv is made on the system Python and sees its
+# site-packages.
+if [ ! -x "$DIR/.venv/bin/python" ]; then
+  "$UV" venv --quiet --python /usr/bin/python3 --system-site-packages "$DIR/.venv"
+fi
+exec "$UV" run --quiet --project "$DIR" --no-dev python -m whisrs_ui "$@"

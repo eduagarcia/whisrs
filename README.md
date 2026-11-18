@@ -31,7 +31,7 @@ Other hotkeys read selected text aloud, rewrite it with an LLM, or hand a task t
 - **Voice + coding agents**: give Claude Code, OpenCode, Codex or GitHub Copilot a hotkey; it works in its project, answers in a short reply spoken through `[tts]`, and an optional overlay shows what it is doing. [Agent mode](docs/agents.md)
 - **Meeting transcription**: record your mic and the system audio, then get a timestamped Markdown transcript with [speaker names](docs/recording.md#speaker-names), an optional [summary](docs/recording.md#summaries), and a read-only [MCP server](docs/recording.md#mcp-server) so an agent can search your recordings. [Recording](docs/recording.md)
 - **Setup and config**: a setup wizard, a full-screen [config editor](#configuration) that an AI agent can drive too (through `taria-mcp`, see `man whisrs`), and [profiles](docs/configuration.md#profiles) that switch the backend and other settings (offline, work) with one command.
-- **Extras**: tray icon, on-screen overlay, [word replacements](docs/configuration.md#word-replacements), a [vocabulary file](docs/configuration.md#the-vocabulary-file), dictation history, and a failed dictation's audio kept for `whisrs transcribe-recovery`.
+- **Extras**: a [desktop window](contrib/whisrs-ui/README.md) for settings, history and recovery, tray icon, on-screen overlay, [word replacements](docs/configuration.md#word-replacements), a [vocabulary file](docs/configuration.md#the-vocabulary-file), dictation history, and a failed dictation's audio kept for `whisrs transcribe-recovery`.
 
 What changed in each release: [GitHub Releases](https://github.com/y0sif/whisrs/releases).
 

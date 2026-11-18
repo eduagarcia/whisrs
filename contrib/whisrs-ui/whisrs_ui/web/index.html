@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>whisrs</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+  <nav class="side" aria-label="Seções">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 3h16a5.5 5.5 0 0 1 5.5 5.5v10A5.5 5.5 0 0 1 24 24h-8l-6.5 5.5V24H8a5.5 5.5 0 0 1-5.5-5.5v-10A5.5 5.5 0 0 1 8 3z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><g fill="currentColor"><rect x="7.6" y="11" width="2.6" height="5" rx="1.3"/><rect x="11.6" y="7.5" width="2.6" height="12" rx="1.3"/><rect x="15.6" y="9.5" width="2.6" height="8" rx="1.3"/><rect x="19.6" y="6" width="2.6" height="15" rx="1.3"/><rect x="23.6" y="10.5" width="2.6" height="6" rx="1.3"/></g></svg>
+      <span>whisrs</span>
+    </div>
+    <ul class="nav">
+      <li><button data-page="painel" class="active">Painel</button></li>
+      <li><button data-page="modelos">Modelos</button></li>
+      <li><button data-page="vocabulario">Vocabulário</button></li>
+      <li><button data-page="prompt">Prompt do Luna</button></li>
+      <li><button data-page="historico">Histórico</button></li>
+      <li><button data-page="recuperacao">Recuperação <span class="badge" id="nav-recovery" hidden></span></button></li>
+      <li><button data-page="comandos">Comandos</button></li>
+      <li><button data-page="sons">Sons</button></li>
+      <li><button data-page="tudo">Todas as configurações</button></li>
+      <li><button data-page="toml">Arquivo TOML</button></li>
+    </ul>
+    <div class="state" id="state" data-state="loading">
+      <span class="state-dot" aria-hidden="true"></span>
+      <span class="state-word" id="state-word">conectando…</span>
+    </div>
+  </nav>
+
+  <main class="main" id="main">
+
+    <section class="page active" id="page-painel">
+      <header class="page-head">
+        <h1>Painel</h1>
+        <p class="lede">Do microfone ao cursor. Clique numa etapa para ajustá-la.</p>
+      </header>
+      <div class="chain" id="chain" aria-label="Pipeline do ditado"></div>
+      <div id="alerts" class="alerts"></div>
+      <div class="figures" id="figures"></div>
+      <h2 class="sub">Últimos ditados</h2>
+      <ol class="recent" id="recent"></ol>
+    </section>
+
+    <section class="page" id="page-modelos">
+      <header class="page-head">
+        <h1>Modelos</h1>
+        <p class="lede">O modelo que transcreve o áudio e o LLM que limpa o texto antes de colar.</p>
+      </header>
+      <div class="cols">
+        <div class="panel">
+          <h2>Transcrição</h2>
+          <div class="fields" id="f-asr"></div>
+          <p class="note" id="credit"></p>
+        </div>
+        <div class="panel">
+          <h2>Limpeza pelo LLM</h2>
+          <div class="fields" id="f-llm"></div>
+          <div class="row-actions">
+            <button class="btn" id="test-llm">Testar o LLM</button>
+            <span class="note" id="test-llm-out"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-vocabulario">
+      <header class="page-head">
+        <h1>Vocabulário</h1>
+        <p class="lede">Os termos vão para o MAI como lista de frases e para o Luna no fim do prompt, para saírem escritos como estão aqui.</p>
+      </header>
+      <div class="panel">
+        <div class="vocab-tools">
+          <input type="text" id="vocab-add" placeholder="Novo termo, Enter para incluir" aria-label="Novo termo">
+          <input type="search" id="vocab-filter" placeholder="Filtrar" aria-label="Filtrar termos">
+          <button class="btn ghost" id="vocab-bulk-toggle">Editar como texto</button>
+          <span class="note" id="vocab-count"></span>
+        </div>
+        <div class="chips" id="vocab-chips"></div>
+        <textarea id="vocab-bulk" class="mono" rows="14" hidden aria-label="Um termo por linha"></textarea>
+      </div>
+      <div class="panel">
+        <h2>Substituições fixas</h2>
+        <p class="note">Trocadas no texto sempre, antes do Luna. Servem para o que o modelo erra sempre do mesmo jeito.</p>
+        <table class="table" id="repl"><thead><tr><th>Ouvido como</th><th>Escrever</th><th><span class="sr">Remover</span></th></tr></thead><tbody></tbody></table>
+        <button class="btn ghost" id="repl-add">Incluir substituição</button>
+      </div>
+    </section>
+
+    <section class="page" id="page-prompt">
+      <header class="page-head">
+        <h1>Prompt do Luna</h1>
+        <p class="lede">A instrução que o LLM recebe com cada transcrição. O vocabulário é anexado ao fim dela.</p>
+      </header>
+      <div class="cols wide-left">
+        <div class="panel">
+          <div class="field-line">
+            <label class="switch-label"><input type="checkbox" id="pp-on"> Limpar cada ditado com o LLM</label>
+            <span class="note" id="pp-count"></span>
+          </div>
+          <textarea id="pp-text" class="mono prompt" spellcheck="false" aria-label="Instrução do LLM"></textarea>
+        </div>
+        <div class="panel">
+          <h2>O que vai para o Luna</h2>
+          <p class="note">A mensagem de sistema como o whisrs a monta. O texto transcrito vai em seguida, como mensagem do usuário.</p>
+          <pre class="preview" id="pp-preview"></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-historico">
+      <header class="page-head row">
+        <div>
+          <h1>Histórico</h1>
+          <p class="lede" id="hist-lede">Cada ditado guardado, com o áudio e as respostas.</p>
+        </div>
+        <button class="btn ghost" id="hist-open">Abrir pasta do arquivo</button>
+      </header>
+      <div class="hist">
+        <div class="hist-list">
+          <div class="hist-tools">
+            <input type="search" id="hist-search" placeholder="Buscar no texto" aria-label="Buscar no texto">
+            <div class="seg" id="hist-filter" role="group" aria-label="Filtro">
+              <button data-f="all" class="on">Todos</button>
+              <button data-f="failed">Falharam</button>
+              <button data-f="retry">Com retry</button>
+              <button data-f="fallback">Reserva</button>
+              <button data-f="llm">Sem limpeza</button>
+            </div>
+          </div>
+          <ol id="hist-items" class="hist-items"></ol>
+        </div>
+        <article class="hist-detail" id="hist-detail">
+          <p class="empty">Escolha um ditado na lista.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="page" id="page-recuperacao">
+      <header class="page-head row">
+        <div>
+          <h1>Recuperação</h1>
+          <p class="lede">Áudios de ditados que falharam. Transcrever de novo passa o áudio pelo pipeline inteiro; o texto vai para a área de transferência e para o histórico, e o arquivo sai daqui.</p>
+        </div>
+        <button class="btn ghost" id="rec-open">Abrir pasta</button>
+      </header>
+      <div class="panel">
+        <ol class="rec-items" id="rec-items"></ol>
+      </div>
+      <div class="panel" id="rec-result" hidden>
+        <h2>Texto recuperado</h2>
+        <pre class="preview" id="rec-text"></pre>
+        <button class="btn" id="rec-copy">Copiar</button>
+      </div>
+    </section>
+
+    <section class="page" id="page-comandos">
+      <header class="page-head">
+        <h1>Comandos</h1>
+        <p class="lede">Cada botão roda o mesmo comando que você digitaria no terminal.</p>
+      </header>
+      <div class="cmd-groups" id="cmd-groups"></div>
+      <div class="panel console-panel">
+        <div class="console-head"><h2>Saída</h2><button class="btn ghost small" id="journal">Ver log do serviço</button></div>
+        <pre class="console" id="console">Nada rodou ainda.</pre>
+      </div>
+    </section>
+
+    <section class="page" id="page-sons">
+      <header class="page-head row">
+        <div>
+          <h1>Sons</h1>
+          <p class="lede">O som de cada momento do ditado. Vale no próximo ditado, sem reiniciar.</p>
+        </div>
+        <button class="btn ghost" id="snd-open">Abrir pasta</button>
+      </header>
+      <div class="panel"><ol class="cues" id="cues"></ol></div>
+    </section>
+
+    <section class="page" id="page-tudo">
+      <header class="page-head row">
+        <div>
+          <h1>Todas as configurações</h1>
+          <p class="lede">Cada chave do config.toml, com o padrão e o que ela faz. As alterações ficam pendentes até você salvar.</p>
+        </div>
+        <input type="search" id="all-search" placeholder="Buscar chave ou descrição" aria-label="Buscar configuração">
+      </header>
+      <div class="all">
+        <ul class="all-nav" id="all-nav"></ul>
+        <div class="all-body" id="all-body"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-toml">
+      <header class="page-head row">
+        <div>
+          <h1>Arquivo TOML</h1>
+          <p class="lede" id="toml-path"></p>
+        </div>
+        <div class="row-actions">
+          <button class="btn ghost" id="toml-open">Abrir pasta</button>
+          <button class="btn ghost" id="toml-tui">Abrir whisrs config no terminal</button>
+        </div>
+      </header>
+      <div class="cols wide-left">
+        <div class="panel">
+          <textarea id="toml-text" class="mono toml" spellcheck="false" aria-label="config.toml"></textarea>
+          <div class="row-actions">
+            <button class="btn primary" id="toml-save">Salvar arquivo e reiniciar o whisrs</button>
+            <button class="btn ghost" id="toml-reload">Recarregar do disco</button>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Versões anteriores</h2>
+          <p class="note">Cada salvamento por esta janela guarda o arquivo de antes.</p>
+          <ol class="backups" id="backups"></ol>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="savebar" id="savebar" hidden>
+  <span id="savebar-text"></span>
+  <button class="btn ghost" id="savebar-list">Ver alterações</button>
+  <button class="btn ghost" id="savebar-discard">Descartar</button>
+  <button class="btn primary" id="savebar-save">Salvar e reiniciar o whisrs</button>
+</div>
+
+<dialog id="dialog"><form method="dialog"><h2 id="dialog-title"></h2><div id="dialog-body"></div><menu id="dialog-menu"></menu></form></dialog>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

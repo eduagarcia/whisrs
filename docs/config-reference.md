@@ -22,6 +22,7 @@ Guide: [Batch and streaming backends](configuration.md#batch-and-streaming-backe
 | `audio_feedback` | bool | `false` | `true`, `false` | Tones when dictation starts, stops and is done. |
 | `audio_feedback_volume` | number | `0.5` | 0 to 1 | Volume of the tones. |
 | `tray` | bool | `true` | `true`, `false` | Show the tray icon. It needs a StatusNotifierItem tray host, such as waybar's tray module, KDE Plasma, or GNOME with the AppIndicator extension. Needs the `tray` build feature. |
+| `tray_click` | string | `toggle` | `toggle`, `window` | What a left click on the tray icon does: toggle a dictation, or open the whisrs window (whisrs-ui, when it is installed). Needs the `tray` build feature. |
 | `backend` | string | `groq` | `groq`, `deepgram-streaming`, `deepgram`, `openai-realtime`, `openai`, `openai-compatible-realtime`, `local-whisper`, `asr-sidecar`, `local-vosk` (coming soon), `local-parakeet` (coming soon) | The transcription backend. Its key or model is below. local-vosk and local-parakeet are not implemented yet; set their model_path in config.toml. |
 | `vocabulary` | list | none | strings | Names and terms sent to the backend as a hint. With a vocabulary.txt, a changed list is written back there whole. |
 | `prompt` | string | unset | text | Free-form context for the backend: style, register. Local whisper sends it with every phrase, so write it in the language you dictate in. |

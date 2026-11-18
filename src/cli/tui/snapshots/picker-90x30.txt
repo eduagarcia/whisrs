@@ -11,10 +11,10 @@
    │   Overlay                 audio feedback         off                             │
    │   Read aloud (TTS)        feedback volume        ▰▰▰▰▰▱▱▱▱▱ 50%                  │
    │   Agents                  tray icon              on                              │
-   │   LLM                                                                            │
-   │   LLM commands            The language you dictate in, or auto. whisrs toggle    │
-   │   Recording               -l overrides it for one dictation. en: English.        │
-   │   Hooks                                                                          │
+   │   LLM                     tray click             toggle                          │
+   │   LLM commands                                                                   │
+   │   Recording               The language you dictate in, or auto. whisrs toggle    │
+   │   Hooks                   -l overrides it for one dictation. en: English.        │
    │                                                                                  │
    │                                                                                  │
    │                                                                                  │

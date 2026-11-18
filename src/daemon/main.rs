@@ -283,6 +283,7 @@ async fn main() -> Result<()> {
             tray_notify,
             profile_menu,
             tray_restart,
+            context.config.general.tray_click == "window",
         ));
     }
 
