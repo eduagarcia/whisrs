@@ -235,6 +235,10 @@ api_key = "sk-or-..."   # or leave it out and set WHISRS_ASR_SIDECAR_API_KEY
   a phrase list in OpenRouter's `provider` field; on any other model it is ignored, with
   the same warning.
 
+- A provider there limits bursts (`429 Provider returned 429`): `[general]
+  transcription_retries = 2` sends a batch transcription again after 1 s, then 2 s, and
+  `transcription_fallback_model = "elevenlabs/scribe-v2"` is then asked once.
+
 Read-aloud reaches OpenRouter's voices through `tts-sidecar`:
 
 ```toml
@@ -284,6 +288,7 @@ in `~/.config/whisrs/sounds/`: `start.wav` (a dictation starts), `stop.wav` (it 
 `done.wav` (the text is in). Any WAV works (mono or stereo, any sample rate); at most 1.5 s
 is played. `audio_feedback_volume = 0.5`, the default, plays a file as recorded. A cue
 without a file keeps its built-in tone, and an empty file (`touch stop.wav`) silences it.
+`nothing.wav`, when it exists, replaces the done cue of a dictation with nothing to type.
 
 ### Read-aloud in Arabic
 
@@ -387,8 +392,8 @@ When the file exists, `whisrs config` shows the merged list and writes a changed
 
 ## The dictation archive
 
-`[general] archive_dir = "/path/to/folder"` keeps every batch dictation the backend answered,
-as material to compare backends with later:
+`[general] archive_dir = "/path/to/folder"` keeps every batch dictation the backend was asked
+about, failed ones and failed requests included (`status`, `error`, `asr.failures`):
 
 - `YYYY-MM/<UTC time>_<id>.wav`: the audio, 16 kHz mono.
 - `YYYY-MM/<UTC time>_<id>.json`: the transcription backend's response and the LLM's, each

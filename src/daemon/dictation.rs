@@ -394,7 +394,14 @@ fn report_dictation(
                 );
             }
             if context.config.general.audio_feedback {
-                feedback::play_done(context.config.general.audio_feedback_volume);
+                let volume = context.config.general.audio_feedback_volume;
+                if dictation.text.is_empty() {
+                    // No speech heard, or an empty transcript: nothing was
+                    // typed.
+                    feedback::play_nothing(volume);
+                } else {
+                    feedback::play_done(volume);
+                }
             }
             if context.notify_state() {
                 let preview = truncate_preview(&dictation.text, 77);

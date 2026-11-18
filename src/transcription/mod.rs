@@ -120,7 +120,8 @@ pub fn recording_phrase_silence_ms(configured: u64) -> u64 {
 /// Cloudflare's 520 to 524, such as a 524 origin timeout on a long upload).
 /// Cloud backends return it inside their `anyhow::Error` so a long job such
 /// as a recording can back off and resume ([`retry::retry_rate_limited`]),
-/// while dictation, which does not retry, shows the same message as before.
+/// and a dictation can send it again a few times (`[general]
+/// transcription_retries`) before it shows the same message as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryableHttpError {
     pub status: u16,

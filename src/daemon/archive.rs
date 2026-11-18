@@ -1,6 +1,9 @@
 //! The dictation archive (`[general] archive_dir`): every batch dictation's
 //! audio, what the transcription backend and the LLM answered, the texts
-//! and the cost, kept as material to compare backends with later.
+//! and the cost, kept as material to compare backends with later. A
+//! dictation that failed is kept as well, and so is every request that
+//! failed on the way to one that worked (a retry, a fallback model): the
+//! status and the body each was refused with.
 //!
 //! The folder is usually a network share, and a share that is down must not
 //! hold a dictation up (an NFS mount that stopped answering blocks every
@@ -29,7 +32,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use whisrs::capture::{Captured, Response};
+use whisrs::capture::{Captured, Failure, Response};
 
 /// A sync is running (or stuck in a mount that stopped answering).
 static SYNCING: AtomicBool = AtomicBool::new(false);
@@ -47,7 +50,8 @@ pub(crate) struct Dictation {
     pub(crate) language: String,
     /// `[general] backend`.
     pub(crate) backend: String,
-    /// The transcription model the backend was asked for.
+    /// The transcription model the backend is configured with. The entry
+    /// names the model that answered, which a fallback makes another one.
     pub(crate) asr_model: String,
     /// The LLM that post-processed it, when `llm_post_process` is on.
     pub(crate) llm_model: Option<String>,
@@ -60,6 +64,19 @@ pub(crate) struct Dictation {
     pub(crate) text: String,
     /// The LLM's reply is that text (not a fallback to the transcript).
     pub(crate) post_processed: bool,
+    /// Why the dictation failed (no text came of it), when it did.
+    pub(crate) error: Option<String>,
+}
+
+impl Dictation {
+    /// The model that transcribed it: the one that answered, or the
+    /// configured one when none did.
+    fn answering_model(&self) -> &str {
+        self.captured
+            .asr_model
+            .as_deref()
+            .unwrap_or(&self.asr_model)
+    }
 }
 
 /// The local folder dictations wait in until the archive folder takes them.
@@ -149,12 +166,19 @@ fn entry_json(dictation: &Dictation, stem: &str, now: DateTime<Utc>) -> Value {
         "duration_secs": dictation.samples.len() as f64 / 16_000.0,
         "language": dictation.language,
         "backend": dictation.backend,
+        // "failed": no text came of it, and `error` says why.
+        "status": if dictation.error.is_some() { "failed" } else { "ok" },
+        "error": dictation.error,
         "asr": {
-            "model": dictation.asr_model,
+            // The model that answered: the fallback model when it did.
+            "model": dictation.answering_model(),
+            "configured_model": dictation.asr_model,
             "latency_ms": asr.map(|r| r.elapsed.as_millis() as u64),
             // What whisrs kept of it: after fillers and [replacements].
             "transcript": dictation.transcript,
             "response": asr.map(body_json),
+            // Every request that failed, retries included, in order.
+            "failures": failures_json(&dictation.captured.asr_failures),
         },
         "llm": dictation.llm_model.as_ref().map(|model| json!({
             "model": model,
@@ -163,6 +187,7 @@ fn entry_json(dictation: &Dictation, stem: &str, now: DateTime<Utc>) -> Value {
             // was used as it was.
             "used": dictation.post_processed,
             "response": llm.map(body_json),
+            "failures": failures_json(&dictation.captured.llm_failures),
         })),
         "text": dictation.text,
         "cost": cost_json(dictation),
@@ -171,7 +196,29 @@ fn entry_json(dictation: &Dictation, stem: &str, now: DateTime<Utc>) -> Value {
 
 /// A response body as JSON, or as the text it was when it is not JSON.
 fn body_json(response: &Response) -> Value {
-    serde_json::from_str(&response.body).unwrap_or_else(|_| Value::String(response.body.clone()))
+    text_json(&response.body)
+}
+
+/// `body` as JSON, or as the text it is when it is not JSON.
+fn text_json(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
+}
+
+/// The requests that failed: the model each asked for, the HTTP status
+/// (`null` for a request that got no answer), how long it took and the body
+/// it was refused with (or the error's text).
+fn failures_json(failures: &[Failure]) -> Value {
+    failures
+        .iter()
+        .map(|failure| {
+            json!({
+                "model": failure.model,
+                "status": failure.status,
+                "latency_ms": failure.elapsed.as_millis() as u64,
+                "response": text_json(&failure.body),
+            })
+        })
+        .collect()
 }
 
 /// What the dictation cost, from each response's `usage`: the audio seconds
@@ -196,7 +243,7 @@ fn cost_json(dictation: &Dictation) -> Value {
     };
     json!({
         "asr": {
-            "model": dictation.asr_model,
+            "model": dictation.answering_model(),
             "usd": asr_usd,
             "audio_seconds": number(&asr, "seconds"),
         },
@@ -323,6 +370,8 @@ fn append_cost_line(dir: &Path, entry: &Value) -> anyhow::Result<()> {
         "timestamp": entry["timestamp"],
         "id": entry["id"],
         "duration_secs": entry["duration_secs"],
+        "status": entry["status"],
+        "asr_failed_requests": entry["asr"]["failures"].as_array().map_or(0, Vec::len),
         "asr_model": cost["asr"]["model"],
         "asr_audio_seconds": cost["asr"]["audio_seconds"],
         "asr_usd": cost["asr"]["usd"],
@@ -362,10 +411,12 @@ mod tests {
                     body: r#"{"choices":[{"message":{"content":"Oi, tudo bem?"}}],"usage":{"prompt_tokens":80,"completion_tokens":6,"total_tokens":86}}"#.into(),
                     elapsed: Duration::from_millis(1300),
                 }),
+                ..Captured::default()
             },
             transcript: "oi tudo bem".into(),
             text: "Oi, tudo bem?".into(),
             post_processed: true,
+            error: None,
         }
     }
 
@@ -465,6 +516,99 @@ mod tests {
         assert_eq!(entry["asr"]["response"], "plain text");
         assert!(entry["cost"]["asr"]["usd"].is_null());
         assert!(entry["cost"]["reported_usd"].is_null());
+    }
+
+    fn rate_limited(model: &str) -> Failure {
+        Failure {
+            model: model.into(),
+            status: Some(429),
+            body: r#"{"error":{"message":"Provider returned 429","code":429}}"#.into(),
+            elapsed: Duration::from_millis(450),
+        }
+    }
+
+    /// A dictation the fallback model answered names that model and its
+    /// cost, and keeps what the configured model was refused with.
+    #[test]
+    fn an_entry_answered_by_the_fallback_model_keeps_the_failed_requests() {
+        let mut d = dictation();
+        d.captured.asr_model = Some("elevenlabs/scribe-v2".into());
+        d.captured.asr_failures = vec![
+            rate_limited("microsoft/mai-transcribe-2"),
+            Failure {
+                model: "microsoft/mai-transcribe-2".into(),
+                status: None,
+                body: "connection reset".into(),
+                elapsed: Duration::from_millis(20),
+            },
+        ];
+        d.captured.llm_failures = vec![Failure {
+            model: "gpt-6-luna".into(),
+            status: Some(503),
+            body: "busy".into(),
+            elapsed: Duration::from_millis(30),
+        }];
+        let entry = entry_json(&d, "x", now());
+        assert_eq!(entry["status"], "ok");
+        assert!(entry["error"].is_null());
+        assert_eq!(entry["asr"]["model"], "elevenlabs/scribe-v2");
+        assert_eq!(
+            entry["asr"]["configured_model"],
+            "microsoft/mai-transcribe-2"
+        );
+        assert_eq!(entry["cost"]["asr"]["model"], "elevenlabs/scribe-v2");
+        let failures = entry["asr"]["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0]["status"], 429);
+        assert_eq!(failures[0]["latency_ms"], 450);
+        assert_eq!(failures[0]["response"]["error"]["code"], 429);
+        assert!(failures[1]["status"].is_null());
+        assert_eq!(failures[1]["response"], "connection reset");
+        assert_eq!(entry["llm"]["failures"][0]["status"], 503);
+    }
+
+    /// A dictation that failed is archived whole: its audio, the error and
+    /// every refusal, with a cost line that says it failed.
+    #[test]
+    fn a_failed_dictation_is_archived_with_its_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (spool, dir) = (tmp.path().join("spool"), tmp.path().join("archive"));
+        std::fs::create_dir(&dir).unwrap();
+        let mut d = dictation();
+        d.captured = Captured {
+            asr_failures: vec![
+                rate_limited("microsoft/mai-transcribe-2"),
+                rate_limited("elevenlabs/scribe-v2"),
+            ],
+            ..Captured::default()
+        };
+        d.transcript = String::new();
+        d.text = String::new();
+        d.post_processed = false;
+        d.error = Some("ASR sidecar error (429): Provider returned 429".into());
+
+        let stem = write_to_spool(&spool, &d, now()).unwrap();
+        assert_eq!(sync_spool(&spool, &dir).unwrap(), 1);
+        let month = dir.join("2026-11");
+        assert!(month.join(format!("{stem}.wav")).is_file());
+        let entry: Value =
+            serde_json::from_slice(&std::fs::read(month.join(format!("{stem}.json"))).unwrap())
+                .unwrap();
+        assert_eq!(entry["status"], "failed");
+        assert_eq!(
+            entry["error"],
+            "ASR sidecar error (429): Provider returned 429"
+        );
+        // No model answered: the configured one is named.
+        assert_eq!(entry["asr"]["model"], "microsoft/mai-transcribe-2");
+        assert!(entry["asr"]["response"].is_null());
+        assert_eq!(entry["asr"]["failures"][1]["model"], "elevenlabs/scribe-v2");
+
+        let costs = std::fs::read_to_string(dir.join("costs.jsonl")).unwrap();
+        let line: Value = serde_json::from_str(costs.lines().next().unwrap()).unwrap();
+        assert_eq!(line["status"], "failed");
+        assert_eq!(line["asr_failed_requests"], 2);
+        assert!(line["asr_usd"].is_null());
     }
 
     #[test]

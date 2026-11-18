@@ -539,11 +539,21 @@ async fn chat_with_key(
         // Without the URL, which some endpoints carry a key in: the error
         // reaches recording.json when the LLM names speakers.
         .map_err(reqwest::Error::without_url)
+        .inspect_err(|e| {
+            crate::capture::llm_failure(&config.model, None, &e.to_string(), sent_at.elapsed());
+        })
         .context("failed to reach the LLM API; check your internet connection")?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        // For the dictation archive: what the endpoint refused it with.
+        crate::capture::llm_failure(
+            &config.model,
+            Some(status.as_u16()),
+            &body,
+            sent_at.elapsed(),
+        );
         if status.as_u16() == 401 {
             anyhow::bail!("LLM API: invalid API key; check [llm] api_key in config.toml");
         }
@@ -555,6 +565,9 @@ async fn chat_with_key(
         .text()
         .await
         .map_err(reqwest::Error::without_url)
+        .inspect_err(|e| {
+            crate::capture::llm_failure(&config.model, None, &e.to_string(), sent_at.elapsed());
+        })
         .context("failed to read the LLM response")?;
     // For the dictation archive: the body carries the usage the reply drops.
     crate::capture::llm_response(&body, sent_at.elapsed());

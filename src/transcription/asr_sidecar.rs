@@ -249,17 +249,28 @@ impl AsrSidecarBackend {
         // waits those out. One that took the request and then closed the
         // connection crashed on it, which is final (`final_if_crashed`).
         let sent_at = std::time::Instant::now();
+        // For the dictation archive: a request that got no answer.
+        let unanswered = |e: &reqwest::Error| {
+            crate::capture::asr_failure(&config.model, None, &e.to_string(), sent_at.elapsed());
+        };
         let response = request
             .multipart(form)
             .send()
             .await
+            .inspect_err(unanswered)
             .map_err(sidecar_error)?;
         let status = response.status();
         let retry_after = super::retry_after_header(response.headers());
-        let body = response.text().await.map_err(sidecar_error)?;
+        let body = response
+            .text()
+            .await
+            .inspect_err(unanswered)
+            .map_err(sidecar_error)?;
 
         if !status.is_success() {
             let code = status.as_u16();
+            // For the dictation archive: what the server refused it with.
+            crate::capture::asr_failure(&config.model, Some(code), &body, sent_at.elapsed());
             let message = match serde_json::from_str::<AsrSidecarErrorResponse>(&body)
                 .ok()
                 .and_then(|err_resp| err_resp.message())
@@ -283,7 +294,7 @@ impl AsrSidecarBackend {
         }
         // For the dictation archive: the body carries the provider's usage
         // and cost, which the parsed transcript drops.
-        crate::capture::asr_response(&body, sent_at.elapsed());
+        crate::capture::asr_response(&config.model, &body, sent_at.elapsed());
         Ok(body)
     }
 

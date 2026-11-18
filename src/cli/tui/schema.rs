@@ -268,6 +268,10 @@ pub const FREE_TEXT: &[(&str, &str)] = &[
     ),
     ("llm.service_tier", "a value your model's endpoint names"),
     ("general.archive_dir", "a folder of your own"),
+    (
+        "general.transcription_fallback_model",
+        "a model id of your backend",
+    ),
     ("hooks.on_record_start", "a shell command of your own"),
     ("hooks.on_record_stop", "a shell command of your own"),
     ("llm_commands.name", "a name you choose"),
@@ -499,6 +503,30 @@ const GENERAL: &[Field] = &[
         },
         "Keep each batch dictation's audio, the backend's and the LLM's responses and their \
          cost in this folder. Written locally first, so a share that is down holds nothing up.",
+    ),
+    field(
+        "general.transcription_retries",
+        "transcription retries",
+        Kind::Int(Steps {
+            min: 0,
+            max: 5,
+            step: 1,
+            big: 2,
+            unit: "",
+            named: &[(0, "off")],
+        }),
+        "Send a batch transcription again this many times when it is rate limited, the service \
+         is overloaded or does not answer. It waits 1 to 5 s before each.",
+    ),
+    field(
+        "general.transcription_fallback_model",
+        "fallback model",
+        Kind::Text {
+            unset: Some("none"),
+            check: None,
+        },
+        "The model asked once more when the retries ran out: another model of the same \
+         backend, such as one another provider runs on OpenRouter.",
     ),
     field(
         "general.audio_feedback",
@@ -1528,6 +1556,8 @@ mod tests {
                 llm_post_process: true,
                 llm_instruction: "i".into(),
                 archive_dir: some("/tmp/archive"),
+                transcription_retries: 2,
+                transcription_fallback_model: some("elevenlabs/scribe-v2"),
             },
             audio: AudioConfig {
                 device: "default".into(),

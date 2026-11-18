@@ -6,7 +6,7 @@
    │ ┃ ▌ de  German                                  ┃  │
    │ ┃   use "ger"                                   ┃  │
    │ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  │
-   │   history          on                              │
+   │   history                on                        │
    │                                                    │
    │   The language you dictate in, or auto. whisrs     │
    │   toggle -l overrides it for one dictation. en:    │

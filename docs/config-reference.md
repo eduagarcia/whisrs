@@ -17,6 +17,8 @@ Guide: [Batch and streaming backends](configuration.md#batch-and-streaming-backe
 | `notify` | bool | `true` | `true`, `false` | Desktop notifications for dictation and errors. |
 | `history` | bool | `true` | `true`, `false` | Keep finished dictations for whisrs log. Off stops new entries; whisrs log --clear removes the old ones. |
 | `archive_dir` | string | unset (nothing kept) | text | Keep each batch dictation's audio, the backend's and the LLM's responses and their cost in this folder. Written locally first, so a share that is down holds nothing up. |
+| `transcription_retries` | integer | `0` (off) | 0 to 5; `0` = off | Send a batch transcription again this many times when it is rate limited, the service is overloaded or does not answer. It waits 1 to 5 s before each. |
+| `transcription_fallback_model` | string | unset (none) | text | The model asked once more when the retries ran out: another model of the same backend, such as one another provider runs on OpenRouter. |
 | `audio_feedback` | bool | `false` | `true`, `false` | Tones when dictation starts, stops and is done. |
 | `audio_feedback_volume` | number | `0.5` | 0 to 1 | Volume of the tones. |
 | `tray` | bool | `true` | `true`, `false` | Show the tray icon. It needs a StatusNotifierItem tray host, such as waybar's tray module, KDE Plasma, or GNOME with the AppIndicator extension. Needs the `tray` build feature. |

@@ -41,9 +41,10 @@ use whisrs::history::HistoryEntry;
 use whisrs::llm;
 use whisrs::replacements::Replacer;
 use whisrs::state::Action;
+use whisrs::transcription::retry::is_transport_error;
 use whisrs::transcription::{
-    needs_space_between, transcription_prompt, StreamText, TranscriptionBackend,
-    TranscriptionConfig,
+    needs_space_between, transcription_prompt, RetryableHttpError, StreamText,
+    TranscriptionBackend, TranscriptionConfig,
 };
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
@@ -1007,10 +1008,18 @@ pub(crate) async fn transcribe_batch_audio(
 
     let config = batch_transcription_config(&context.config, language, opts.use_prompt);
 
-    let text = match context
-        .transcription_backend
-        .transcribe(&wav_data, &config)
-        .await
+    let text = match transcribe_with_retries(
+        context.transcription_backend.as_ref(),
+        &wav_data,
+        &config,
+        context.config.general.transcription_retries,
+        context
+            .config
+            .general
+            .transcription_fallback_model
+            .as_deref(),
+    )
+    .await
     {
         Ok(t) => t,
         Err(e) => {
@@ -1103,6 +1112,85 @@ pub(crate) async fn transcribe_batch_audio(
     }
 
     Ok(text)
+}
+
+/// The longest wait before a retry, whatever the server asks for: someone
+/// is waiting for the text.
+const RETRY_WAIT_MAX: Duration = Duration::from_secs(5);
+
+/// The wait before retry number `attempt` (0 for the first) of a request
+/// that failed with `err`, or `None` when `err` is not a transient failure
+/// and sending it again would fail the same way (a refused key, no credit, a
+/// bad request). Transient: a [`RetryableHttpError`] (rate limited,
+/// overloaded, a gateway error) or a request that got no answer
+/// ([`is_transport_error`]). The wait is 1 s, doubled per attempt, or what
+/// the server asks for when that is longer, up to [`RETRY_WAIT_MAX`].
+fn retry_wait(err: &anyhow::Error, attempt: u32) -> Option<Duration> {
+    let http = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RetryableHttpError>());
+    let asked = match http {
+        Some(http) => http.retry_after,
+        None if is_transport_error(err) => None,
+        None => return None,
+    };
+    let backoff = Duration::from_secs(1 << attempt.min(3));
+    Some(backoff.max(asked.unwrap_or_default()).min(RETRY_WAIT_MAX))
+}
+
+/// One batch transcription request, ridden through a transient failure
+/// ([`retry_wait`]): sent again up to `retries` times (`[general]
+/// transcription_retries`), then once more for `fallback_model` (`[general]
+/// transcription_fallback_model`) when it is set and is another model. A
+/// failure that is not transient is returned at once, and never tried on
+/// the fallback model: a key that is refused or out of credit is the same
+/// key there.
+async fn transcribe_with_retries(
+    backend: &dyn TranscriptionBackend,
+    audio: &[u8],
+    config: &TranscriptionConfig,
+    retries: u32,
+    fallback_model: Option<&str>,
+) -> Result<String> {
+    let mut attempt = 0;
+    let err = loop {
+        let err = match backend.transcribe(audio, config).await {
+            Ok(text) => return Ok(text),
+            Err(err) => err,
+        };
+        let Some(wait) = retry_wait(&err, attempt) else {
+            return Err(err);
+        };
+        if attempt >= retries {
+            break err;
+        }
+        attempt += 1;
+        warn!(
+            "transcription failed ({err}); retry {attempt} of {retries} in {:.1} s",
+            wait.as_secs_f32()
+        );
+        tokio::time::sleep(wait).await;
+    };
+    let fallback = fallback_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != config.model);
+    let Some(model) = fallback else {
+        return Err(err);
+    };
+    warn!(
+        "transcription with {} failed after {attempt} retries ({err}); asking {model}",
+        config.model
+    );
+    let fallback_config = TranscriptionConfig {
+        model: model.to_string(),
+        ..config.clone()
+    };
+    backend
+        .transcribe(audio, &fallback_config)
+        .await
+        .inspect_err(|fallback_err| {
+            warn!("transcription with the fallback model {model} failed too: {fallback_err}");
+        })
 }
 
 /// Save a failed dictation's audio for `whisrs transcribe-recovery`, then
@@ -1393,14 +1481,24 @@ pub(crate) async fn transcribe_recording_batch(
         anyhow::Ok((transcript, outcome))
     })
     .await;
-    let (transcript, outcome) = result?;
 
-    // Only a dictation the backend answered: a gated one never reached it.
+    // Only a dictation the backend was asked about: a gated one never
+    // reached it. One that failed is kept too, with what the backend
+    // refused it with.
     let config = &context.config;
     if let (Some(dir), true) = (
         crate::archive::archive_dir(config.general.archive_dir.as_deref()),
-        captured.asr.is_some(),
+        captured.asked_asr(),
     ) {
+        let (transcript, text, post_processed, error) = match &result {
+            Ok((transcript, outcome)) => (
+                transcript.clone(),
+                outcome.text.clone(),
+                outcome.post_processed,
+                None,
+            ),
+            Err(e) => (String::new(), String::new(), false, Some(format!("{e:#}"))),
+        };
         crate::archive::archive(
             dir,
             crate::archive::Dictation {
@@ -1412,12 +1510,14 @@ pub(crate) async fn transcribe_recording_batch(
                     .map(|_| config.llm.clone().unwrap_or_default().model),
                 captured,
                 transcript,
-                text: outcome.text.clone(),
-                post_processed: outcome.post_processed,
+                text,
+                post_processed,
+                error,
             },
         );
     }
 
+    let (_, outcome) = result?;
     Ok(outcome)
 }
 
@@ -1750,6 +1850,176 @@ pub(crate) mod tests {
         let mut config: Config = toml::from_str("").expect("empty config uses defaults");
         config.general.vocabulary = vocabulary.iter().map(|t| t.to_string()).collect();
         config
+    }
+
+    /// A backend that answers each `transcribe` with the next scripted
+    /// result and notes the model it was asked for.
+    struct Scripted {
+        answers: StdMutex<std::collections::VecDeque<Result<String>>>,
+        asked: StdMutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(answers: Vec<Result<String>>) -> Self {
+            Self {
+                answers: StdMutex::new(answers.into()),
+                asked: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TranscriptionBackend for Scripted {
+        async fn transcribe(&self, _audio: &[u8], config: &TranscriptionConfig) -> Result<String> {
+            self.asked.lock().unwrap().push(config.model.clone());
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("asked more often than scripted")
+        }
+
+        fn sends_prompt(&self, _config: &TranscriptionConfig) -> bool {
+            false
+        }
+
+        fn stream_text(&self) -> StreamText {
+            StreamText::Phrases
+        }
+
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &TranscriptionConfig,
+        ) -> Result<whisrs::transcription::Transcript> {
+            unreachable!("dictation asks for text only")
+        }
+
+        fn max_segment_chunk_secs(&self, _config: &TranscriptionConfig) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A 429 that asks for `retry_after_secs`, as OpenRouter passes on its
+    /// provider's.
+    fn rate_limited(retry_after_secs: Option<u64>) -> anyhow::Error {
+        RetryableHttpError {
+            status: 429,
+            retry_after: retry_after_secs.map(Duration::from_secs),
+            message: "ASR sidecar error (429): Provider returned 429".into(),
+        }
+        .into()
+    }
+
+    fn main_model_config() -> TranscriptionConfig {
+        TranscriptionConfig {
+            model: "main".into(),
+            ..batch_transcription_config(&config_with_vocabulary(&[]), "pt", false)
+        }
+    }
+
+    #[test]
+    fn retry_wait_grows_follows_the_server_and_is_capped() {
+        let waits = |err: &anyhow::Error| -> Vec<u64> {
+            (0..4)
+                .map(|attempt| retry_wait(err, attempt).unwrap().as_secs())
+                .collect()
+        };
+        assert_eq!(waits(&rate_limited(None)), [1, 2, 4, 5]);
+        // The server's wait when it is the longer one, and never over 5 s.
+        assert_eq!(waits(&rate_limited(Some(3))), [3, 3, 4, 5]);
+        assert_eq!(waits(&rate_limited(Some(60))), [5, 5, 5, 5]);
+        // Under a context it is still found.
+        let wrapped = rate_limited(None).context("while transcribing");
+        assert_eq!(retry_wait(&wrapped, 0), Some(Duration::from_secs(1)));
+        // Not transient: a refused key, no credit, a bad request.
+        let final_error = anyhow::anyhow!("ASR sidecar error (402): Insufficient credits");
+        assert_eq!(retry_wait(&final_error, 0), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_transcription_is_sent_again_after_a_wait() {
+        let backend = Scripted::new(vec![
+            Err(rate_limited(Some(1))),
+            Err(rate_limited(Some(1))),
+            Ok("oi".into()),
+        ]);
+        let started = tokio::time::Instant::now();
+        let text =
+            transcribe_with_retries(&backend, b"wav", &main_model_config(), 2, Some("other"))
+                .await
+                .unwrap();
+        assert_eq!(text, "oi");
+        // Same model three times, after waits of 1 s and 2 s.
+        assert_eq!(backend.asked(), ["main", "main", "main"]);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fallback_model_is_asked_once_when_the_retries_run_out() {
+        let backend = Scripted::new(vec![
+            Err(rate_limited(None)),
+            Err(rate_limited(None)),
+            Err(rate_limited(None)),
+            Ok("from the other model".into()),
+        ]);
+        let text =
+            transcribe_with_retries(&backend, b"wav", &main_model_config(), 2, Some("other"))
+                .await
+                .unwrap();
+        assert_eq!(text, "from the other model");
+        assert_eq!(backend.asked(), ["main", "main", "main", "other"]);
+
+        // A fallback that fails too is the error, with no further request.
+        let backend = Scripted::new(vec![Err(rate_limited(None)), Err(rate_limited(None))]);
+        let err = transcribe_with_retries(&backend, b"wav", &main_model_config(), 0, Some("other"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("429"), "{err}");
+        assert_eq!(backend.asked(), ["main", "other"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_that_is_not_transient_is_neither_retried_nor_given_to_the_fallback() {
+        let backend = Scripted::new(vec![Err(anyhow::anyhow!(
+            "ASR sidecar error (402): Insufficient credits"
+        ))]);
+        let err = transcribe_with_retries(&backend, b"wav", &main_model_config(), 2, Some("other"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("402"), "{err}");
+        assert_eq!(backend.asked(), ["main"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_retries_or_another_model_a_transcription_is_sent_once() {
+        // The defaults: as before the retries existed.
+        let backend = Scripted::new(vec![Err(rate_limited(None))]);
+        assert!(
+            transcribe_with_retries(&backend, b"wav", &main_model_config(), 0, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.asked(), ["main"]);
+
+        // A fallback that is blank, or the configured model again, is none.
+        for fallback in ["  ", "main"] {
+            let backend = Scripted::new(vec![Err(rate_limited(None)), Err(rate_limited(None))]);
+            assert!(transcribe_with_retries(
+                &backend,
+                b"wav",
+                &main_model_config(),
+                1,
+                Some(fallback)
+            )
+            .await
+            .is_err());
+            assert_eq!(backend.asked(), ["main", "main"]);
+        }
     }
 
     #[test]

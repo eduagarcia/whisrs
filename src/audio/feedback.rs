@@ -8,6 +8,9 @@
 //! config.toml (`start.wav`, `stop.wav`, `done.wav`): the file is played in
 //! place of the tone ([`custom_cue`]). An empty file (0 bytes) silences that
 //! cue. A file that cannot be read is warned about and the tone plays.
+//! `nothing.wav` is a cue with no tone of its own: with the file, a
+//! dictation that ends with nothing to type (no speech heard, an empty
+//! transcript) plays it in place of the done cue ([`play_nothing`]).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -142,22 +145,38 @@ pub fn play_stop(volume: f32) {
 pub fn play_done(volume: f32) {
     std::thread::Builder::new()
         .name("whisrs-feedback".into())
-        .spawn(move || {
-            if let Some(samples) = custom_cue("done", volume) {
-                play_samples(&samples);
-                return;
-            }
-            let beep1 = generate_tone(1000.0, 0.07, volume);
-            let silence = vec![0.0f32; (TONE_SAMPLE_RATE as f32 * 0.06) as usize];
-            let beep2 = generate_tone(1200.0, 0.07, volume);
+        .spawn(move || play_done_blocking(volume))
+        .ok();
+}
 
-            let mut samples = Vec::with_capacity(beep1.len() + silence.len() + beep2.len());
-            samples.extend_from_slice(&beep1);
-            samples.extend_from_slice(&silence);
-            samples.extend_from_slice(&beep2);
-            play_samples(&samples);
+/// Play the sound of a dictation that ended with nothing to type:
+/// `sounds/nothing.wav` when it exists, else the done cue, as before that
+/// file was a cue.
+pub fn play_nothing(volume: f32) {
+    std::thread::Builder::new()
+        .name("whisrs-feedback".into())
+        .spawn(move || match custom_cue("nothing", volume) {
+            Some(samples) => play_samples(&samples),
+            None => play_done_blocking(volume),
         })
         .ok();
+}
+
+/// The done cue, on the calling thread.
+fn play_done_blocking(volume: f32) {
+    if let Some(samples) = custom_cue("done", volume) {
+        play_samples(&samples);
+        return;
+    }
+    let beep1 = generate_tone(1000.0, 0.07, volume);
+    let silence = vec![0.0f32; (TONE_SAMPLE_RATE as f32 * 0.06) as usize];
+    let beep2 = generate_tone(1200.0, 0.07, volume);
+
+    let mut samples = Vec::with_capacity(beep1.len() + silence.len() + beep2.len());
+    samples.extend_from_slice(&beep1);
+    samples.extend_from_slice(&silence);
+    samples.extend_from_slice(&beep2);
+    play_samples(&samples);
 }
 
 /// Generate a frequency sweep from `start_hz` to `end_hz` over `duration_secs`.

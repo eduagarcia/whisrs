@@ -675,6 +675,21 @@ pub struct GeneralConfig {
     /// exist; unset keeps nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_dir: Option<String>,
+    /// How many times a batch transcription request (dictation, command
+    /// mode, an LLM command, an agent turn) is sent again after a transient
+    /// failure: rate limited (429), overloaded or a gateway error (502,
+    /// 503, 504, 520 to 524), or no answer at all. The wait is what the
+    /// server asks for (`Retry-After`), at least 1 s then 2 s, 4 s and at
+    /// most 5 s. `0`, the default, sends it once. Any other failure (a
+    /// refused key, no credit, a bad request) is never sent again.
+    #[serde(default)]
+    pub transcription_retries: u32,
+    /// The model asked once more when `[general] transcription_retries`
+    /// ran out on a transient failure: another model of the same backend
+    /// and endpoint (on OpenRouter, one that another provider runs). Unset
+    /// asks no other model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription_fallback_model: Option<String>,
 }
 
 impl Default for GeneralConfig {
@@ -696,6 +711,8 @@ impl Default for GeneralConfig {
             llm_post_process: false,
             llm_instruction: default_llm_instruction(),
             archive_dir: None,
+            transcription_retries: 0,
+            transcription_fallback_model: None,
         }
     }
 }

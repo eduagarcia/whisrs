@@ -1,7 +1,9 @@
 //! Waiting out rate limits (HTTP 429/503) and riding out server errors
 //! (500, 502, 504, Cloudflare's 520 to 524) and network failures for long
-//! jobs such as recordings. Only recording requests go through here;
-//! dictation does not retry.
+//! jobs such as recordings. Only recording requests go through here. A
+//! dictation has a short retry of its own (`[general]
+//! transcription_retries`, in the daemon's pipeline): it cannot wait
+//! minutes.
 //!
 //! One retry layer per request: [`retry_rate_limited`] retries an operation
 //! that fails with a [`RetryableHttpError`] or a transport error
