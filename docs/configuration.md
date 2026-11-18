@@ -277,6 +277,14 @@ aloud; press it again to stop. `whisrs speak --text "..."` reads the given text
 OpenAI-compatible `/v1/audio/speech` server, by default `http://127.0.0.1:8880/v1/audio/speech`
 (Kokoro-FastAPI). Audio cues and read-aloud play on the default output device.
 
+### Your own cue sounds
+
+With `[general] audio_feedback = true`, a cue plays a sound of yours when its file exists
+in `~/.config/whisrs/sounds/`: `start.wav` (a dictation starts), `stop.wav` (it stops) and
+`done.wav` (the text is in). Any WAV works (mono or stereo, any sample rate); at most 1.5 s
+is played. `audio_feedback_volume = 0.5`, the default, plays a file as recorded. A cue
+without a file keeps its built-in tone.
+
 ### Read-aloud in Arabic
 
 Groq's Orpheus also speaks Saudi Arabic. It needs a Groq key:

@@ -3,20 +3,107 @@
 //! Generates simple tones programmatically using `cpal` for playback on the
 //! ALSA host's default output device. Each play function spawns a thread so it never
 //! blocks the caller.
+//!
+//! A cue has a sound of the user's own when `sounds/<cue>.wav` exists beside
+//! config.toml (`start.wav`, `stop.wav`, `done.wav`): the file is played in
+//! place of the tone ([`custom_cue`]). A file that cannot be read is warned
+//! about and the tone plays.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
+use std::path::{Path, PathBuf};
+
 use tracing::warn;
 
 /// Sample rate for generated tones.
 const TONE_SAMPLE_RATE: u32 = 44_100;
+
+/// The longest a custom cue plays; the rest of a longer file is cut.
+const CUSTOM_CUE_MAX_SECS: f32 = 1.5;
+
+/// Where the user's own cue for `name` lives: `sounds/<name>.wav` beside
+/// config.toml.
+fn custom_cue_path(name: &str) -> PathBuf {
+    crate::config_path()
+        .with_file_name("sounds")
+        .join(format!("{name}.wav"))
+}
+
+/// The user's own sound for the cue `name` (`start`, `stop` or `done`), ready
+/// to play, or `None` when there is no such file or it cannot be read.
+fn custom_cue(name: &str, volume: f32) -> Option<Vec<f32>> {
+    let path = custom_cue_path(name);
+    if !path.is_file() {
+        return None;
+    }
+    match read_cue(&path, volume) {
+        Ok(samples) => Some(samples),
+        Err(e) => {
+            warn!(
+                "cannot play {}: {e}; playing the built-in tone",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Read a WAV file as mono samples at [`TONE_SAMPLE_RATE`]. Any channel count
+/// and sample rate, integer or float samples. `volume` 0.5, the default of
+/// `audio_feedback_volume`, plays the file as recorded; 1.0 doubles it.
+fn read_cue(path: &Path, volume: f32) -> anyhow::Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample.clamp(1, 32) - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|sample| sample.map(|v| v as f32 / scale))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let mono: Vec<f32> = interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .collect();
+    let gain = volume * 2.0;
+    let mut samples = resample_linear(&mono, spec.sample_rate, TONE_SAMPLE_RATE);
+    samples.truncate((TONE_SAMPLE_RATE as f32 * CUSTOM_CUE_MAX_SECS) as usize);
+    for sample in &mut samples {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+    Ok(samples)
+}
+
+/// `samples` at rate `from`, as samples at rate `to`, by linear interpolation:
+/// plenty for a short cue.
+fn resample_linear(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || from == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let len = (samples.len() as u64 * u64::from(to) / u64::from(from)) as usize;
+    let step = f64::from(from) / f64::from(to);
+    (0..len)
+        .map(|i| {
+            let pos = i as f64 * step;
+            let at = pos as usize;
+            let next = (at + 1).min(samples.len() - 1);
+            let frac = (pos - at as f64) as f32;
+            samples[at.min(samples.len() - 1)] * (1.0 - frac) + samples[next] * frac
+        })
+        .collect()
+}
 
 /// Play the "start recording" sound: a short rising tone (800Hz -> 1200Hz, ~150ms).
 pub fn play_start(volume: f32) {
     std::thread::Builder::new()
         .name("whisrs-feedback".into())
         .spawn(move || {
-            let samples = generate_sweep(800.0, 1200.0, 0.15, volume);
+            let samples = custom_cue("start", volume)
+                .unwrap_or_else(|| generate_sweep(800.0, 1200.0, 0.15, volume));
             play_samples(&samples);
         })
         .ok();
@@ -27,7 +114,8 @@ pub fn play_stop(volume: f32) {
     std::thread::Builder::new()
         .name("whisrs-feedback".into())
         .spawn(move || {
-            let samples = generate_sweep(1200.0, 800.0, 0.15, volume);
+            let samples = custom_cue("stop", volume)
+                .unwrap_or_else(|| generate_sweep(1200.0, 800.0, 0.15, volume));
             play_samples(&samples);
         })
         .ok();
@@ -38,6 +126,10 @@ pub fn play_done(volume: f32) {
     std::thread::Builder::new()
         .name("whisrs-feedback".into())
         .spawn(move || {
+            if let Some(samples) = custom_cue("done", volume) {
+                play_samples(&samples);
+                return;
+            }
             let beep1 = generate_tone(1000.0, 0.07, volume);
             let silence = vec![0.0f32; (TONE_SAMPLE_RATE as f32 * 0.06) as usize];
             let beep2 = generate_tone(1200.0, 0.07, volume);
@@ -195,6 +287,56 @@ fn play_samples(samples: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stereo 48 kHz 16-bit file comes back mono at the playback rate, at
+    /// its own level with the default volume, and cut at the cue limit.
+    #[test]
+    fn a_custom_cue_is_read_as_mono_at_the_playback_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        // 0.5 s: left at half scale, right silent, so mono is a quarter.
+        for _ in 0..24_000 {
+            writer.write_sample(16_384i16).unwrap();
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let samples = read_cue(&path, 0.5).unwrap();
+        assert_eq!(samples.len(), 22_050);
+        assert!((samples[100] - 0.25).abs() < 1e-3, "{}", samples[100]);
+        // Volume 1.0 doubles it.
+        assert!((read_cue(&path, 1.0).unwrap()[100] - 0.5).abs() < 1e-3);
+
+        // A long file is cut.
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..(48_000 * 3 * 2) {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        assert_eq!(
+            read_cue(&path, 0.5).unwrap().len(),
+            (TONE_SAMPLE_RATE as f32 * CUSTOM_CUE_MAX_SECS) as usize
+        );
+
+        // Not a WAV file: an error, so the tone plays.
+        std::fs::write(&path, b"not audio").unwrap();
+        assert!(read_cue(&path, 0.5).is_err());
+    }
+
+    #[test]
+    fn resample_linear_keeps_the_same_rate_untouched() {
+        let samples = vec![0.0, 0.5, 1.0];
+        assert_eq!(resample_linear(&samples, 44_100, 44_100), samples);
+        assert_eq!(resample_linear(&samples, 22_050, 44_100).len(), 6);
+        assert!(resample_linear(&[], 48_000, 44_100).is_empty());
+    }
 
     #[test]
     fn generate_sweep_correct_length() {
