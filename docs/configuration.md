@@ -283,7 +283,7 @@ With `[general] audio_feedback = true`, a cue plays a sound of yours when its fi
 in `~/.config/whisrs/sounds/`: `start.wav` (a dictation starts), `stop.wav` (it stops) and
 `done.wav` (the text is in). Any WAV works (mono or stereo, any sample rate); at most 1.5 s
 is played. `audio_feedback_volume = 0.5`, the default, plays a file as recorded. A cue
-without a file keeps its built-in tone.
+without a file keeps its built-in tone, and an empty file (`touch stop.wav`) silences it.
 
 ### Read-aloud in Arabic
 

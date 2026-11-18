@@ -6,8 +6,8 @@
 //!
 //! A cue has a sound of the user's own when `sounds/<cue>.wav` exists beside
 //! config.toml (`start.wav`, `stop.wav`, `done.wav`): the file is played in
-//! place of the tone ([`custom_cue`]). A file that cannot be read is warned
-//! about and the tone plays.
+//! place of the tone ([`custom_cue`]). An empty file (0 bytes) silences that
+//! cue. A file that cannot be read is warned about and the tone plays.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -17,6 +17,16 @@ use tracing::warn;
 
 /// Sample rate for generated tones.
 const TONE_SAMPLE_RATE: u32 = 44_100;
+
+/// Silence played before every cue. An output that was idle (nothing else
+/// playing) drops the first stretch of a new stream while it starts: about
+/// 60 to 110 ms measured on PipeWire, which is most of a short cue. The
+/// silence is what gets dropped instead.
+const OUTPUT_WAKE_LEAD_IN: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a stream stays open after its samples were all handed over, for
+/// the last of them to be heard.
+const OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The longest a custom cue plays; the rest of a longer file is cut.
 const CUSTOM_CUE_MAX_SECS: f32 = 1.5;
@@ -30,13 +40,20 @@ fn custom_cue_path(name: &str) -> PathBuf {
 }
 
 /// The user's own sound for the cue `name` (`start`, `stop` or `done`), ready
-/// to play, or `None` when there is no such file or it cannot be read.
+/// to play, or `None` when there is no such file or it cannot be read. No
+/// samples at all means the cue is silenced.
 fn custom_cue(name: &str, volume: f32) -> Option<Vec<f32>> {
-    let path = custom_cue_path(name);
-    if !path.is_file() {
-        return None;
+    custom_cue_at(&custom_cue_path(name), volume)
+}
+
+/// [`custom_cue`] for the file at `path`.
+fn custom_cue_at(path: &Path, volume: f32) -> Option<Vec<f32>> {
+    let size = std::fs::metadata(path).ok().filter(|m| m.is_file())?.len();
+    if size == 0 {
+        // An empty file: this cue stays silent.
+        return Some(Vec::new());
     }
-    match read_cue(&path, volume) {
+    match read_cue(path, volume) {
         Ok(samples) => Some(samples),
         Err(e) => {
             warn!(
@@ -191,8 +208,19 @@ fn generate_tone(freq_hz: f32, duration_secs: f32, volume: f32) -> Vec<f32> {
     samples
 }
 
+/// `samples` after `lead_in` samples of silence.
+fn with_lead_in(samples: &[f32], lead_in: usize) -> Vec<f32> {
+    let mut out = vec![0.0; lead_in];
+    out.extend_from_slice(samples);
+    out
+}
+
 /// Play f32 samples on the default output device (blocking until complete).
+/// Nothing to play (a silenced cue) opens no stream.
 fn play_samples(samples: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
     let host = match super::device::alsa_host() {
         Ok(host) => host,
         Err(e) => {
@@ -232,7 +260,8 @@ fn play_samples(samples: &[f32]) {
         // Try anyway — cpal may do conversion.
     }
 
-    let samples = samples.to_vec();
+    let lead_in = (OUTPUT_WAKE_LEAD_IN.as_secs_f32() * TONE_SAMPLE_RATE as f32) as usize;
+    let samples = with_lead_in(samples, lead_in);
     let sample_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sample_idx_clone = std::sync::Arc::clone(&sample_idx);
     let samples_len = samples.len();
@@ -269,8 +298,9 @@ fn play_samples(samples: &[f32]) {
         return;
     }
 
-    // Wait for playback to finish (with a timeout).
-    let timeout = std::time::Duration::from_secs(2);
+    // Wait until the callback has taken every sample (with a timeout).
+    let length = std::time::Duration::from_secs_f32(samples_len as f32 / TONE_SAMPLE_RATE as f32);
+    let timeout = length + std::time::Duration::from_secs(2);
     let start = std::time::Instant::now();
     while !done.load(std::sync::atomic::Ordering::Acquire) {
         if start.elapsed() > timeout {
@@ -279,8 +309,8 @@ fn play_samples(samples: &[f32]) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // Small extra delay to let the last buffer drain.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Taken is not heard yet: let the device's buffer drain.
+    std::thread::sleep(OUTPUT_DRAIN);
     drop(stream);
 }
 
@@ -328,6 +358,18 @@ mod tests {
         // Not a WAV file: an error, so the tone plays.
         std::fs::write(&path, b"not audio").unwrap();
         assert!(read_cue(&path, 0.5).is_err());
+        assert!(custom_cue_at(&path, 0.5).is_none());
+
+        // An empty file silences the cue; no file leaves the tone.
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(custom_cue_at(&path, 0.5), Some(Vec::new()));
+        assert!(custom_cue_at(&dir.path().join("stop.wav"), 0.5).is_none());
+    }
+
+    #[test]
+    fn a_cue_is_played_after_the_lead_in_silence() {
+        let out = with_lead_in(&[0.5, -0.5], 3);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.5, -0.5]);
     }
 
     #[test]
