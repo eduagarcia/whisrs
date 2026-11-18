@@ -842,6 +842,13 @@ const TYPING: &[Field] = &[
         Kind::Bool,
         "Type a space after each batch dictation, so the next one does not run into it.",
     ),
+    field(
+        "input.soft_line_breaks",
+        "soft line breaks",
+        Kind::Bool,
+        "Type a line break as Shift+Enter outside terminals, so a chat does not send the \
+         message at each line. For typed text; pasted text keeps its line breaks.",
+    ),
 ];
 
 const HOTKEYS: &[Field] = &[
@@ -1574,6 +1581,7 @@ mod tests {
                 refocus: true,
                 queue: true,
                 trailing_space: true,
+                soft_line_breaks: true,
             },
             deepgram: Some(DeepgramConfig {
                 api_key: "k".into(),

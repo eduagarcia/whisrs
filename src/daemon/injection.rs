@@ -212,6 +212,9 @@ pub(crate) struct KeystrokeSettings {
     /// ignores it and always waits for the release (see
     /// [`deliver_streaming_delta`]).
     pub(crate) modifier_wait: std::time::Duration,
+    /// `[input] soft_line_breaks`: a line break in typed text is sent as
+    /// Shift+Enter outside a terminal ([`type_lines`]).
+    pub(crate) soft_line_breaks: bool,
 }
 
 impl KeystrokeSettings {
@@ -220,6 +223,7 @@ impl KeystrokeSettings {
             key_delay: std::time::Duration::from_millis(input.key_delay_ms),
             backend: input.backend,
             modifier_wait: std::time::Duration::from_millis(input.modifier_wait_ms),
+            soft_line_breaks: input.soft_line_breaks,
         }
     }
 }
@@ -285,7 +289,14 @@ pub(crate) fn notify_copied_for_held_modifier(text: &str) {
 /// before it). The caller owes that rest a clipboard copy. The clear and the
 /// text share one hold of [`KEYBOARD`], so no other injection lands between
 /// them.
-fn type_text_with_clear(text: &str, keys: KeystrokeSettings, clear_line: bool) -> Result<Typed> {
+///
+/// With `soft_breaks`, a line break is sent as Shift+Enter ([`type_lines`]).
+fn type_text_with_clear(
+    text: &str,
+    keys: KeystrokeSettings,
+    clear_line: bool,
+    soft_breaks: bool,
+) -> Result<Typed> {
     let typed = with_persistent_keyboard(
         keys,
         ModifierPolicy::Capped(keys.modifier_wait),
@@ -293,12 +304,45 @@ fn type_text_with_clear(text: &str, keys: KeystrokeSettings, clear_line: bool) -
             if clear_line {
                 clear_line_best_effort(keyboard);
             }
-            keyboard
-                .type_text(text, gate)
-                .context("failed to type text")
+            type_lines(keyboard, text, gate, soft_breaks).context("failed to type text")
         },
     )?;
     Ok(typed.unwrap_or(Typed::StoppedAt(0)))
+}
+
+/// Type `text` on `keyboard`. With `soft_breaks`, each line break is sent as
+/// Shift+Enter in place of Enter: in a chat (Slack, a coding agent's prompt,
+/// a messenger) Enter sends the message, so a dictation typed with a list in
+/// it went out as one message per line, while Shift+Enter breaks the line
+/// inside the message, as it does in an editor. `gate` is asked about the
+/// line break like about any character, with its offset in `text`, and the
+/// result counts bytes of `text`.
+fn type_lines(
+    keyboard: &mut dyn xkb_type::KeyInjector,
+    text: &str,
+    gate: &mut dyn FnMut(usize) -> ControlFlow<()>,
+    soft_breaks: bool,
+) -> Result<Typed> {
+    use evdev::Key;
+
+    if !soft_breaks || !text.contains('\n') {
+        return keyboard.type_text(text, gate);
+    }
+    let mut offset = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            let line_break = offset - 1;
+            if gate(line_break).is_break() {
+                return Ok(Typed::StoppedAt(line_break));
+            }
+            keyboard.send_combo(&[Key::KEY_LEFTSHIFT, Key::KEY_ENTER])?;
+        }
+        if let Typed::StoppedAt(at) = keyboard.type_text(line, &mut |at| gate(offset + at))? {
+            return Ok(Typed::StoppedAt(offset + at));
+        }
+        offset += line.len() + 1;
+    }
+    Ok(Typed::All)
 }
 
 /// The part of `text` a typing run that stopped after `typed` bytes did not
@@ -813,13 +857,16 @@ fn modifier_probe() -> impl FnMut() -> bool {
 /// (see [`whisrs::InputConfig::paste`]). Runs in a blocking context (callers
 /// wrap it in `spawn_blocking`), so the sleeps/restore use std threads.
 ///
-/// `ClipboardBackend` is text-only, so a clipboard holding non-text content
-/// (an image, a file list, ...) can't be captured and round-tripped at all.
-/// If the pre-paste read fails, this falls back to typing instead of pasting
-/// — overwriting the clipboard via `set_text` first and only then discovering
+/// The clipboard is taken with [`ClipboardBackend::save`] first and given
+/// back after the paste. On Wayland that covers an image too (a screenshot
+/// waiting to be pasted): its bytes are kept and restored. Content a backend
+/// cannot take (X11 with anything but text, a file list with no text form)
+/// fails the save, and this falls back to typing instead of pasting:
+/// overwriting the clipboard via `set_text` first and only then discovering
 /// there's nothing valid to restore would destroy that content permanently
 /// (see #69), which skipping the *restore* alone can't undo since the damage
-/// already happened at `set_text`.
+/// already happened at `set_text`. That typing sends line breaks as
+/// Shift+Enter under `[input] soft_line_breaks` ([`type_lines`]).
 ///
 /// The restore is otherwise skipped, rather than clobbering the clipboard,
 /// when the clipboard no longer holds the text we set — something else (the
@@ -908,8 +955,13 @@ fn inject_text_with_clipboard(
         return Ok(Injection::Delivered);
     }
 
+    // Soft line breaks are for windows where Enter may send: at a terminal
+    // a dictation's line breaks were folded already, and command mode's
+    // rewrite of a command line keeps its own.
+    let soft_breaks = keys.soft_line_breaks && !is_terminal && !clear_line;
+
     if !paste {
-        let result = type_text_with_clear(text, keys, clear_line);
+        let result = type_text_with_clear(text, keys, clear_line, soft_breaks);
         if let Ok(Typed::StoppedAt(typed)) = result {
             // Typing stopped at a held modifier: the clipboard gets only the
             // untyped rest, to paste after the typed part. The full copy
@@ -933,11 +985,11 @@ fn inject_text_with_clipboard(
         return result.map(|_| Injection::Delivered);
     }
 
-    let saved = match clipboard.get_text() {
+    let saved = match clipboard.save() {
         Ok(s) => s,
         Err(e) => {
-            warn!("clipboard unreadable as text, typing instead of pasting: {e:#}");
-            return match type_text_with_clear(text, keys, clear_line)? {
+            warn!("clipboard cannot be saved, typing instead of pasting: {e:#}");
+            return match type_text_with_clear(text, keys, clear_line, soft_breaks)? {
                 Typed::All => Ok(Injection::Delivered),
                 // Overwrites the non-text clipboard (#69's concern), but the
                 // alternative is dropping the rest of the dictation, which is
@@ -984,7 +1036,7 @@ fn inject_text_with_clipboard(
         std::thread::sleep(restore_delay);
         match clipboard.get_text() {
             Ok(current) if current == pasted_text => {
-                if let Err(e) = clipboard.set_text(&saved) {
+                if let Err(e) = clipboard.restore(&saved) {
                     warn!("failed to restore clipboard: {e}");
                 }
             }
@@ -1991,6 +2043,8 @@ mod tests {
     struct MockKeyboard {
         typed: Arc<StdMutex<Vec<String>>>,
         paste_combos: Arc<StdMutex<usize>>,
+        /// The keys of every combo, in order.
+        combos: Arc<StdMutex<Vec<Vec<evdev::Key>>>>,
         events: Arc<StdMutex<Vec<&'static str>>>,
         fail_typing: bool,
     }
@@ -2025,9 +2079,10 @@ mod tests {
             Ok(())
         }
 
-        fn send_combo(&mut self, _keys: &[evdev::Key]) -> anyhow::Result<()> {
+        fn send_combo(&mut self, keys: &[evdev::Key]) -> anyhow::Result<()> {
             self.events.lock().unwrap().push("combo");
             *self.paste_combos.lock().unwrap() += 1;
+            self.combos.lock().unwrap().push(keys.to_vec());
             Ok(())
         }
 
@@ -2060,6 +2115,7 @@ mod tests {
             key_delay: std::time::Duration::from_millis(1),
             backend: InjectorBackend::Uinput,
             modifier_wait,
+            soft_line_breaks: false,
         }
     }
 
@@ -2115,6 +2171,185 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         });
         result.unwrap()
+    }
+
+    /// A clipboard that holds an image, as the Wayland backend takes it: no
+    /// text to read until something is written, and `save` hands the image
+    /// over. Records what was written and what was restored.
+    #[derive(Default)]
+    struct ImageClipboard {
+        writes: StdMutex<Vec<String>>,
+        restored: StdMutex<Vec<xkb_type::SavedClipboard>>,
+    }
+
+    impl ImageClipboard {
+        fn image() -> xkb_type::SavedClipboard {
+            xkb_type::SavedClipboard::Data {
+                mime: "image/png".into(),
+                bytes: vec![0x89, b'P', b'N', b'G'],
+            }
+        }
+    }
+
+    impl ClipboardBackend for ImageClipboard {
+        fn get_text(&self) -> anyhow::Result<String> {
+            self.writes
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("clipboard holds non-text content"))
+        }
+
+        fn set_text(&self, text: &str) -> anyhow::Result<()> {
+            self.writes.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        fn get_primary_selection(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn save(&self) -> anyhow::Result<xkb_type::SavedClipboard> {
+            Ok(Self::image())
+        }
+
+        fn restore(&self, saved: &xkb_type::SavedClipboard) -> anyhow::Result<()> {
+            self.restored.lock().unwrap().push(saved.clone());
+            Ok(())
+        }
+    }
+
+    const SHIFT_ENTER: [evdev::Key; 2] = [evdev::Key::KEY_LEFTSHIFT, evdev::Key::KEY_ENTER];
+
+    fn soft_break_keys() -> KeystrokeSettings {
+        KeystrokeSettings {
+            soft_line_breaks: true,
+            ..test_keys()
+        }
+    }
+
+    /// The bug this guards: with a screenshot on the clipboard, a dictation
+    /// was typed key by key, and each of its line breaks was an Enter that
+    /// sent the message in a chat. The image is now saved, the text pasted
+    /// whole (line breaks inside it), and the image put back.
+    #[test]
+    fn an_image_on_the_clipboard_is_pasted_over_and_put_back() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ImageClipboard::default());
+        let keyboard = MockKeyboard::default();
+        let (typed, combos) = (Arc::clone(&keyboard.typed), Arc::clone(&keyboard.combos));
+
+        let result = inject(
+            keyboard,
+            Arc::clone(&clipboard),
+            "1. um\n2. dois",
+            /* paste = */ true,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
+        );
+
+        assert_eq!(result.unwrap(), Injection::Delivered);
+        assert!(typed.lock().unwrap().is_empty(), "nothing may be typed");
+        assert_eq!(
+            *combos.lock().unwrap(),
+            vec![vec![evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V]],
+            "one Ctrl+V, and no Enter"
+        );
+        assert_eq!(
+            *clipboard.writes.lock().unwrap(),
+            vec!["1. um\n2. dois".to_string()]
+        );
+        assert_eq!(
+            *clipboard.restored.lock().unwrap(),
+            vec![ImageClipboard::image()]
+        );
+    }
+
+    #[test]
+    fn typed_line_breaks_are_shift_enter_under_soft_line_breaks() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Typing mode never reads the clipboard: an empty script panics on it.
+        for (keys, want_typed, want_combos) in [
+            (
+                soft_break_keys(),
+                vec!["um", "dois", "três"],
+                vec![SHIFT_ENTER.to_vec(); 3],
+            ),
+            // Off, the default: the line breaks go to the keyboard as they are.
+            (test_keys(), vec!["um\ndois\n\ntrês"], vec![]),
+        ] {
+            let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+            let keyboard = MockKeyboard::default();
+            let (typed, combos) = (Arc::clone(&keyboard.typed), Arc::clone(&keyboard.combos));
+            let result = inject_with_keys(
+                keys,
+                keyboard,
+                clipboard,
+                "um\ndois\n\ntrês",
+                /* paste = */ false,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            );
+            assert_eq!(result.unwrap(), Injection::Delivered);
+            assert_eq!(*typed.lock().unwrap(), want_typed);
+            assert_eq!(*combos.lock().unwrap(), want_combos);
+        }
+    }
+
+    /// Paste mode with a clipboard that cannot be saved types instead, and
+    /// that typing must not send a message at each line either.
+    #[test]
+    fn a_clipboard_that_cannot_be_saved_types_with_soft_line_breaks() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[None]));
+        let keyboard = MockKeyboard::default();
+        let (typed, combos) = (Arc::clone(&keyboard.typed), Arc::clone(&keyboard.combos));
+
+        let result = inject_with_keys(
+            soft_break_keys(),
+            keyboard,
+            Arc::clone(&clipboard),
+            "a\nb",
+            /* paste = */ true,
+            /* clipboard_fallback = */ false,
+            /* clipboard_only = */ false,
+        );
+
+        assert_eq!(result.unwrap(), Injection::Delivered);
+        assert_eq!(*typed.lock().unwrap(), vec!["a", "b"]);
+        assert_eq!(*combos.lock().unwrap(), vec![SHIFT_ENTER.to_vec()]);
+        assert!(clipboard.writes().is_empty(), "the clipboard is left alone");
+    }
+
+    /// A gate that stops the typing reports the offset in the whole text,
+    /// whichever line it stopped in, and a stop at a line break sends no
+    /// Shift+Enter.
+    #[test]
+    fn type_lines_counts_a_stop_in_bytes_of_the_whole_text() {
+        for (stop_at, want_typed, want_combos) in [
+            (4, vec!["ab", "c"], 1), // before the "d" of the second line
+            (2, vec!["ab"], 0),      // before the line break itself
+        ] {
+            let mut keyboard = MockKeyboard::default();
+            let (typed, combos) = (Arc::clone(&keyboard.typed), Arc::clone(&keyboard.combos));
+            let outcome = type_lines(
+                &mut keyboard,
+                "ab\ncd",
+                &mut |at| {
+                    if at == stop_at {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                },
+                /* soft_breaks = */ true,
+            )
+            .unwrap();
+            assert_eq!(outcome, Typed::StoppedAt(stop_at));
+            assert_eq!(*typed.lock().unwrap(), want_typed);
+            assert_eq!(combos.lock().unwrap().len(), want_combos);
+        }
     }
 
     #[test]

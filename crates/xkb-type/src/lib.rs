@@ -196,6 +196,17 @@ impl KeyInjector for Keyboard {
 // ClipboardBackend trait
 // ---------------------------------------------------------------------------
 
+/// What a clipboard held when [`ClipboardBackend::save`] took it, to put
+/// back with [`ClipboardBackend::restore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedClipboard {
+    /// Text, or `""` for an empty clipboard.
+    Text(String),
+    /// Content that is not text (an image, ...): one of the types it was
+    /// offered as, and its bytes. The other types of the offer are not kept.
+    Data { mime: String, bytes: Vec<u8> },
+}
+
 /// Trait for clipboard get/set operations.
 pub trait ClipboardBackend: Send + Sync {
     /// Read the current clipboard text content.
@@ -211,6 +222,25 @@ pub trait ClipboardBackend: Send + Sync {
 
     /// Read the primary selection (highlighted text, no Ctrl+C needed).
     fn get_primary_selection(&self) -> anyhow::Result<String>;
+
+    /// Take what the clipboard holds, so a caller that borrows the clipboard
+    /// (a paste) can put it back with [`restore`](Self::restore). `Err` when
+    /// the content cannot be taken: the caller must then leave the clipboard
+    /// alone. The default takes text only ([`get_text`](Self::get_text)); a
+    /// backend that can also take an image overrides it.
+    fn save(&self) -> anyhow::Result<SavedClipboard> {
+        self.get_text().map(SavedClipboard::Text)
+    }
+
+    /// Put back what [`save`](Self::save) took.
+    fn restore(&self, saved: &SavedClipboard) -> anyhow::Result<()> {
+        match saved {
+            SavedClipboard::Text(text) => self.set_text(text),
+            SavedClipboard::Data { mime, .. } => {
+                anyhow::bail!("this clipboard backend cannot restore {mime} content")
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

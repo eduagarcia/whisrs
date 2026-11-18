@@ -88,7 +88,7 @@ virtual keyboard when the compositor has it, else uinput (`/dev/uinput`).
   drops characters (some Ink-based ones, such as Claude Code, do); uinput treats 0 as 1.
 - `paste = true` pastes with Ctrl+V (Ctrl+Shift+V in a terminal) instead of typing, which
   fixes garbled text on [non-US layouts](troubleshooting.md#garbled-output--wrong-characters-on-non-us-layouts).
-  It replaces the clipboard for a moment and restores it after.
+  It restores the clipboard after (on Wayland an image too; what it cannot save is typed).
 - `clipboard_fallback = true` also leaves the text in the clipboard (only the untyped rest
   when a held modifier stopped the typing). `clipboard_only = true` copies and never types
   or pastes, whatever the two keys above say. `whisrs cancel` never copies anything.
@@ -98,8 +98,8 @@ virtual keyboard when the compositor has it, else uinput (`/dev/uinput`).
   the tray and pill show transcribing until the last one is in.
 - `refocus = false` leaves the focus alone: a batch dictation's text goes to whatever is
   focused when it is ready, not to the window the dictation started in.
-- `trailing_space = true` follows each batch dictation with a space, so the next one does
-  not run into it.
+- `trailing_space = true` follows each batch dictation with a space. `soft_line_breaks =
+  true` types a line break as Shift+Enter outside terminals, so a chat does not send it.
 
 ## Terminal detection
 

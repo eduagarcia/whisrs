@@ -953,6 +953,17 @@ pub struct InputConfig {
     /// keeps the text without it.
     #[serde(default)]
     pub trailing_space: bool,
+    /// Send a line break in typed text as Shift+Enter, not Enter, outside a
+    /// terminal. In a chat (Slack, a coding agent's prompt, a messenger)
+    /// Enter sends the message, so a dictation with a list in it would go
+    /// out as one message per line; Shift+Enter breaks the line inside the
+    /// message there, and in an editor. Applies to text that is typed: with
+    /// `paste = false`, and with `paste = true` when the clipboard could not
+    /// be saved and the text is typed instead. Pasted text needs no key for
+    /// its line breaks. Off by default: a spreadsheet moves up a cell on
+    /// Shift+Enter.
+    #[serde(default)]
+    pub soft_line_breaks: bool,
 }
 
 impl Default for InputConfig {
@@ -968,6 +979,7 @@ impl Default for InputConfig {
             refocus: true,
             queue: false,
             trailing_space: false,
+            soft_line_breaks: false,
         }
     }
 }

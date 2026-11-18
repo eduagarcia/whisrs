@@ -119,6 +119,7 @@ Guide: [Terminal detection](configuration.md#terminal-detection).
 | `refocus` | bool | `true` | `true`, `false` | Focus the window a dictation started in before its text is typed. Off, the text lands in whatever is focused when it is ready. |
 | `queue` | bool | `false` | `true`, `false` | Transcribe a stopped dictation in the background, so the next one can start at once; the texts are typed in order. Batch backends only. |
 | `trailing_space` | bool | `false` | `true`, `false` | Type a space after each batch dictation, so the next one does not run into it. |
+| `soft_line_breaks` | bool | `false` | `true`, `false` | Type a line break as Shift+Enter outside terminals, so a chat does not send the message at each line. For typed text; pasted text keeps its line breaks. |
 
 ## [hotkeys]
 

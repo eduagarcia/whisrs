@@ -1,6 +1,6 @@
 //! Clipboard implementations — Wayland (wl-copy/wl-paste), X11 (arboard), and noop.
 
-use crate::ClipboardBackend;
+use crate::{ClipboardBackend, SavedClipboard};
 use anyhow::Context;
 use std::process::Command;
 
@@ -106,6 +106,78 @@ fn pick_text_type(offered: &[&str]) -> Option<&'static str> {
         .find(|t| offered.contains(t))
 }
 
+/// The most a non-text clipboard may weigh to be saved and restored around
+/// a paste ([`WaylandClipboard::save`]). Past it the content is left alone.
+const SAVED_DATA_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The type to save a non-text offer as, given `offered` (as reported by
+/// `wl-paste --list-types`): `image/png` when it is there (what a screenshot
+/// or a copied image is pasted as), else the first other image type, else
+/// the first type that names content. `None` when only bookkeeping targets
+/// are offered (`TARGETS`, `SAVE_TARGETS`, an app's private markers), which
+/// carry nothing to put back.
+fn pick_data_type<'a>(offered: &[&'a str]) -> Option<&'a str> {
+    let is_content = |mime: &&str| {
+        mime.contains('/')
+            && !mime.starts_with("chromium/")
+            && !mime.starts_with("text/_moz_")
+            && !mime.starts_with("application/x-kde")
+    };
+    offered
+        .iter()
+        .copied()
+        .find(|mime| *mime == "image/png")
+        .or_else(|| offered.iter().copied().find(|m| m.starts_with("image/")))
+        .or_else(|| offered.iter().copied().find(is_content))
+}
+
+/// The types the clipboard is offered as (`wl-paste --list-types`). Empty
+/// when nothing is copied.
+fn offered_types() -> anyhow::Result<Vec<String>> {
+    let output = Command::new("wl-paste")
+        .arg("--list-types")
+        .output()
+        .context("failed to run wl-paste --list-types — is wl-clipboard installed?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_empty_clipboard_message(&stderr) {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("wl-paste --list-types failed: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+/// Feed `bytes` to `wl-copy` (with `args`), which keeps serving them as the
+/// clipboard.
+fn run_wl_copy(args: &[&str], bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut child = Command::new("wl-copy")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to run wl-copy — is wl-clipboard installed?")?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(bytes)
+            .context("failed to write to wl-copy stdin")?;
+    }
+
+    let status = child.wait().context("failed to wait for wl-copy")?;
+    if !status.success() {
+        #[cfg(feature = "logging")]
+        log::warn!("wl-copy exited with status {status}");
+    }
+
+    Ok(())
+}
+
 /// Whether a `wl-paste` stderr message means "the clipboard has no selection
 /// at all" (a legitimate empty string). Kept as a defensive fallback in case
 /// `--list-types` itself ever errors instead of returning an empty listing.
@@ -122,30 +194,54 @@ impl ClipboardBackend for WaylandClipboard {
     }
 
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
-        use std::io::Write;
-
-        let mut child = Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to run wl-copy — is wl-clipboard installed?")?;
-
-        if let Some(ref mut stdin) = child.stdin {
-            stdin
-                .write_all(text.as_bytes())
-                .context("failed to write to wl-copy stdin")?;
-        }
-
-        let status = child.wait().context("failed to wait for wl-copy")?;
-        if !status.success() {
-            #[cfg(feature = "logging")]
-            log::warn!("wl-copy exited with status {status}");
-        }
-
-        Ok(())
+        run_wl_copy(&[], text.as_bytes())
     }
 
     fn get_primary_selection(&self) -> anyhow::Result<String> {
         run_wl_paste(&["--primary"], "wl-paste --primary")
+    }
+
+    /// Text as [`get_text`](Self::get_text) reads it. A clipboard that holds
+    /// no text (a screenshot, a copied image) is taken as the bytes of one
+    /// of its types ([`pick_data_type`]), so a paste can borrow the
+    /// clipboard and give the image back.
+    fn save(&self) -> anyhow::Result<SavedClipboard> {
+        let offered = offered_types()?;
+        let offered: Vec<&str> = offered.iter().map(String::as_str).collect();
+        if offered.is_empty() || pick_text_type(&offered).is_some() {
+            return self.get_text().map(SavedClipboard::Text);
+        }
+        let Some(mime) = pick_data_type(&offered) else {
+            anyhow::bail!("wl-paste: clipboard holds nothing to save (offered types: {offered:?})");
+        };
+        let output = Command::new("wl-paste")
+            .args(["--type", mime])
+            .output()
+            .context("failed to run wl-paste — is wl-clipboard installed?")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("wl-paste --type {mime} failed: {stderr}");
+        }
+        if output.stdout.is_empty() {
+            anyhow::bail!("wl-paste --type {mime} returned nothing");
+        }
+        if output.stdout.len() > SAVED_DATA_MAX_BYTES {
+            anyhow::bail!(
+                "clipboard holds {} bytes of {mime}, too much to save and restore",
+                output.stdout.len()
+            );
+        }
+        Ok(SavedClipboard::Data {
+            mime: mime.to_string(),
+            bytes: output.stdout,
+        })
+    }
+
+    fn restore(&self, saved: &SavedClipboard) -> anyhow::Result<()> {
+        match saved {
+            SavedClipboard::Text(text) => self.set_text(text),
+            SavedClipboard::Data { mime, bytes } => run_wl_copy(&["--type", mime], bytes),
+        }
     }
 }
 
@@ -319,6 +415,82 @@ mod tests {
         // Case-insensitive: wording/casing has varied across wl-clipboard
         // versions.
         assert!(is_empty_clipboard_message("nothing is copied\n"));
+    }
+
+    /// A non-text offer is saved as its PNG, else another image type, else
+    /// the first type with content; bookkeeping targets alone are nothing.
+    #[test]
+    fn pick_data_type_prefers_the_png_then_an_image_then_any_content() {
+        // A screenshot copied in a Chromium app.
+        assert_eq!(
+            pick_data_type(&[
+                "image/png",
+                "chromium/x-internal-source-rfh-token",
+                "chromium/x-source-url"
+            ]),
+            Some("image/png")
+        );
+        // "Copy image" in Firefox: the HTML comes first, the PNG is taken.
+        assert_eq!(
+            pick_data_type(&["text/html", "text/_moz_htmlinfo", "image/png", "image/bmp"]),
+            Some("image/png")
+        );
+        assert_eq!(
+            pick_data_type(&["text/html", "image/jpeg", "image/webp"]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            pick_data_type(&["text/_moz_htmlinfo", "text/html", "SAVE_TARGETS"]),
+            Some("text/html")
+        );
+        assert_eq!(pick_data_type(&["TARGETS", "SAVE_TARGETS"]), None);
+        assert_eq!(pick_data_type(&["chromium/x-source-url"]), None);
+    }
+
+    /// On a real Wayland session: an image on the clipboard is saved, survives
+    /// a text being written over it, and comes back byte for byte. Ignored by
+    /// default because it borrows the session's clipboard (whatever was there
+    /// is put back at the end, text or one type of anything else).
+    /// Run with `cargo test -p xkb-type -- --ignored image_round_trip`.
+    #[test]
+    #[ignore = "borrows the clipboard of a running Wayland session"]
+    fn image_round_trip_on_a_wayland_session() {
+        let clipboard = WaylandClipboard;
+        let before = clipboard
+            .save()
+            .expect("the session's clipboard can be saved");
+
+        // A PNG signature and some bytes: wl-copy does not look inside.
+        let png: Vec<u8> = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+            .into_iter()
+            .chain((0..=255u8).cycle().take(4096))
+            .collect();
+        run_wl_copy(&["--type", "image/png"], &png).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        assert!(clipboard.get_text().is_err(), "an image is not text");
+        let saved = clipboard.save().unwrap();
+        assert_eq!(
+            saved,
+            SavedClipboard::Data {
+                mime: "image/png".into(),
+                bytes: png.clone()
+            }
+        );
+
+        clipboard.set_text("texto colado\ncom duas linhas").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            clipboard.get_text().unwrap(),
+            "texto colado\ncom duas linhas"
+        );
+
+        clipboard.restore(&saved).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let again = clipboard.save();
+
+        clipboard.restore(&before).unwrap();
+        assert_eq!(again.unwrap(), saved, "the image is back as it was");
     }
 
     /// A selection that exists but isn't text must NOT be treated as empty —
