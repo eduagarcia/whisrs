@@ -122,7 +122,12 @@
       <div class="hist">
         <div class="hist-list">
           <div class="hist-tools">
-            <input type="search" id="hist-search" placeholder="Buscar no texto" aria-label="Buscar no texto">
+            <input type="search" id="hist-search" placeholder="Buscar no que você disse (sem acento, &quot;frase exata&quot;)" aria-label="Buscar no texto">
+            <div class="seg" id="hist-source" role="group" aria-label="Origem">
+              <button data-s="" class="on">Tudo</button>
+              <button data-s="whisrs">whisrs</button>
+              <button data-s="wispr">Wispr Flow</button>
+            </div>
             <div class="seg" id="hist-filter" role="group" aria-label="Filtro">
               <button data-f="all" class="on">Todos</button>
               <button data-f="failed">Falharam</button>

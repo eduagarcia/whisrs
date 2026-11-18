@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 
 from . import archive, config
+from . import history as hist
 
 HOME = pathlib.Path.home()
 WISPR_SOUNDS = pathlib.Path("/opt/wispr-flow-appimage/usr/lib/wispr-flow/resources/assets/sounds")
@@ -115,10 +116,81 @@ class Api:
         service = run(["systemctl", "--user", "is-active", "whisrs.service"], timeout=5)["out"].strip()
         return {"running": running, "state": state, "detail": text, "service": service}
 
+    # -- the index ------------------------------------------------------------
+
+    def _index(self, refresh: bool = False):
+        """The dictation index (local when this machine writes it, else the
+        published copy), brought up to date first when `refresh` and this is
+        the machine that writes it. `None` when there is none."""
+        cfg = config.load()
+        folder = archive.archive_dir(cfg) or hist.DEFAULT_ARCHIVE
+        if refresh and hist.local_index().is_file():
+            try:
+                hist.update(folder, hist.wispr_dir(folder), hist.local_index(), publish=True, quiet=True)
+            except Exception:  # noqa: BLE001 - a stale index still answers
+                traceback.print_exc()
+        for path in (hist.local_index(), hist.published_index(folder)):
+            if path.is_file():
+                return hist.connect_ro(path)
+        return None
+
+    @staticmethod
+    def _summary(r) -> dict:
+        d = {k: r[k] for k in r.keys()}
+        return {
+            "id": d["id"], "timestamp": d["ts"], "source": d["source"],
+            "where": "spool" if "archive-spool" in (d["record"] or "") else d["source"],
+            "duration": d["duration"], "language": d["language"], "status": d["status"] or "ok",
+            "error": d["error"], "asr_model": d["asr_model"], "configured_model": d["configured_model"],
+            "fallback": bool(d["asr_model"] and d["configured_model"] and d["asr_model"] != d["configured_model"]),
+            "asr_failures": d["asr_failures"] or 0, "asr_latency_ms": d["asr_ms"],
+            "llm_model": d["llm_model"], "llm_used": bool(d["llm_used"]), "llm_failures": d["llm_failures"] or 0,
+            "llm_latency_ms": d["llm_ms"], "usd": d["usd"], "llm_tokens": d["llm_tokens"],
+            "chars": len(d["text"] or ""), "preview": (d.get("snip") or d["text"] or "")[:260],
+            "app": d["app"], "window_title": d["window_title"], "url": d["url"],
+        }
+
+    _FILTERS = {
+        "failed": "d.status = 'failed'",
+        "retry": "d.asr_failures > 0",
+        "fallback": "d.asr_model != d.configured_model",
+        "llm": "d.llm_model IS NOT NULL AND d.llm_used = 0",
+    }
+
+    def _totals(self, con) -> dict:
+        today = time.strftime("%Y-%m-%d")
+
+        def agg(where, params=()):
+            r = con.execute(
+                "SELECT COUNT(*), SUM(coalesce(duration,0)), SUM(coalesce(usd,0)), SUM(status='failed'), "
+                "SUM(asr_failures), SUM(llm_failures), SUM(asr_model != configured_model) "
+                f"FROM dictations d WHERE {where}", params).fetchone()
+            keys = ("count", "seconds", "usd", "failed", "asr_failures", "llm_failures", "fallbacks")
+            return {k: (v or 0) for k, v in zip(keys, r)}
+
+        return {
+            "all": agg("source = 'whisrs'"),
+            "today": agg("source = 'whisrs' AND substr(local_ts, 1, 10) = ?", (today,)),
+            "wispr": agg("source = 'wispr'"),
+        }
+
     @_guard
     def overview(self) -> dict:
         cfg = config.load()
-        listing = archive.list_entries(cfg)
+        con = self._index(refresh=True)
+        if con is not None:
+            rows = con.execute(
+                "SELECT d.* FROM dictations d WHERE source = 'whisrs' ORDER BY ts DESC LIMIT 40").fetchall()
+            recent = [self._summary(r) for r in rows]
+            folder = archive.archive_dir(cfg)
+            listing = {
+                "entries": recent,
+                "totals": self._totals(con),
+                "problem": None if folder is None or folder.is_dir()
+                else f"A pasta do arquivo não está acessível: {folder}",
+            }
+        else:
+            listing = archive.list_entries(cfg)
         recent = listing["entries"][:40]
         last_llm_error = next(
             (r for r in recent if r["llm_failures"] and not r["llm_used"]),
@@ -356,20 +428,68 @@ class Api:
     # -- history and recovery -------------------------------------------------
 
     @_guard
-    def history(self) -> dict:
-        cfg = config.load()
-        listing = archive.list_entries(cfg)
-        if not listing["entries"]:
-            listing["log"] = archive.history(300)
-        return listing
+    def history(self, query: str = "", source: str = "", flt: str = "all", limit: int = 400) -> dict:
+        """Dictations from the index, newest first, matching `query` (full
+        text, accents ignored), `source` (whisrs, wispr) and `flt`."""
+        con = self._index(refresh=not query)
+        if con is None:
+            listing = archive.list_entries(config.load())
+            if not listing["entries"]:
+                listing["log"] = archive.history(300)
+            listing["indexed"] = False
+            return listing
+        where, params = [], []
+        if source in ("whisrs", "wispr"):
+            where.append("d.source = ?")
+            params.append(source)
+        if flt in self._FILTERS:
+            where.append(self._FILTERS[flt])
+        limit = max(1, min(int(limit), 2000))
+        if query.strip():
+            sql = ("SELECT d.*, snippet(search, 1, '', '', '…', 30) AS snip FROM search "
+                   "JOIN dictations d ON d.id = search.id WHERE search MATCH ?"
+                   + "".join(f" AND {w}" for w in where) + " ORDER BY d.ts DESC LIMIT ?")
+            rows = con.execute(sql, [hist.fts_query(query), *params, limit]).fetchall()
+        else:
+            sql = "SELECT d.* FROM dictations d" + (" WHERE " + " AND ".join(where) if where else "")
+            rows = con.execute(sql + " ORDER BY d.ts DESC LIMIT ?", [*params, limit]).fetchall()
+        return {"entries": [self._summary(r) for r in rows], "totals": self._totals(con),
+                "problem": None, "indexed": True}
+
+    def _index_row(self, entry_id: str):
+        con = self._index()
+        if con is None:
+            return None
+        return con.execute("SELECT * FROM dictations WHERE id = ?", (entry_id,)).fetchone()
 
     @_guard
     def entry(self, entry_id: str) -> dict:
-        return archive.entry_detail(config.load(), entry_id)
+        row = self._index_row(entry_id)
+        if row is not None and row["source"] == "wispr":
+            # Wispr Flow's export has no record per dictation: the index row is it.
+            audio = pathlib.Path(row["audio"]) if row["audio"] else None
+            entry = {
+                "id": row["id"], "timestamp": row["ts"], "duration_secs": row["duration"],
+                "language": row["language"], "status": "ok", "text": row["text"],
+                "window": {"class": row["app"], "title": row["url"]},
+                "asr": {"model": "Wispr Flow", "transcript": row["raw"], "latency_ms": row["asr_ms"], "failures": []},
+                "llm": {}, "cost": {}, "source": "wispr", "wispr_status": row["status"],
+            }
+            detail = {"entry": entry, "summary": self._summary(row), "folder": str(pathlib.Path(row["record"]).parent)}
+            detail.update(archive.audio_payload(audio) if audio else {"audio": None, "peaks": []})
+            return detail
+        detail = archive.entry_detail(config.load(), entry_id)
+        if row is not None:
+            detail["summary"].update({"app": row["app"], "window_title": row["window_title"]})
+        return detail
 
     @_guard
     def retranscribe(self, entry_id: str) -> dict:
-        name = archive.copy_to_recovery(config.load(), entry_id)
+        row = self._index_row(entry_id)
+        if row is not None and row["audio"]:
+            name = archive.copy_audio_to_recovery(pathlib.Path(row["audio"]))
+        else:
+            name = archive.copy_to_recovery(config.load(), entry_id)
         return self.transcribe_recovery(name)
 
     @_guard

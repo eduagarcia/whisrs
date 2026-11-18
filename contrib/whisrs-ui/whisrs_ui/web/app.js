@@ -565,28 +565,32 @@ function renderPromptPreview() {
  * Histórico
  * --------------------------------------------------------------------- */
 
-async function renderHist() {
-  $("#hist-items").replaceChildren(h("li", {}, h("span", { class: "note" }, h("span", { class: "spin" }), " carregando")));
-  try { S.hist = await call("history"); } catch (e) { fail(e); return; }
-  const t = S.hist.totals.all;
-  $("#hist-lede").textContent = S.hist.problem
-    ? S.hist.problem
-    : `${nf(t.count)} ditados, ${secs(t.seconds)} de fala, ${usd(t.usd)}. ${t.failed ? `${t.failed} falharam. ` : ""}${t.fallbacks ? `${t.fallbacks} foram pela reserva.` : ""}`;
+let histSeq = 0;
+async function renderHist(keepSelection = true) {
+  const seq = ++histSeq;
+  if (!S.hist) $("#hist-items").replaceChildren(h("li", {}, h("span", { class: "note" }, h("span", { class: "spin" }), " carregando")));
+  let r;
+  try { r = await call("history", $("#hist-search").value, S.histSource || "", S.histFilter, 400); } catch (e) { fail(e); return; }
+  if (seq !== histSeq) return; // a newer search is on its way
+  S.hist = r;
+  const t = r.totals.all, w = r.totals.wispr;
+  $("#hist-lede").textContent = r.problem
+    ? r.problem
+    : `${nf(t.count)} ditados no whisrs, ${secs(t.seconds)} de fala, ${usd(t.usd)}.${t.failed ? ` ${t.failed} falharam.` : ""}${t.fallbacks ? ` ${t.fallbacks} foram pela reserva.` : ""}${w && w.count ? ` Mais ${nf(w.count)} do Wispr Flow (${secs(w.seconds)}).` : ""}`;
   drawHistList();
-  const first = S.histSel || (S.hist.entries[0] && S.hist.entries[0].id);
-  if (first) selectHist(first);
+  const ids = r.entries.map((e) => e.id);
+  const first = keepSelection && S.histSel && ids.includes(S.histSel) ? S.histSel : ids[0];
+  if (first && first !== $("#hist-detail").dataset.id) selectHist(first);
+  if (!first) $("#hist-detail").replaceChildren(h("p", { class: "empty", text: "Nenhum ditado com esse filtro." }));
 }
 
-function histRows() {
-  const q = $("#hist-search").value.trim().toLowerCase();
-  return (S.hist ? S.hist.entries : []).filter((r) => {
-    if (S.histFilter === "failed" && r.status !== "failed") return false;
-    if (S.histFilter === "retry" && !r.asr_failures) return false;
-    if (S.histFilter === "fallback" && !r.fallback) return false;
-    if (S.histFilter === "llm" && !(r.llm_model && !r.llm_used)) return false;
-    if (q && !((r.preview || "") + " " + (r.error || "")).toLowerCase().includes(q)) return false;
-    return true;
-  });
+function histRows() { return S.hist ? S.hist.entries : []; }
+
+const APP_NAMES = { "com.t3tools.T3Code": "T3 Code", "firefox": "Firefox", "google-chrome": "Chrome", "Slack": "Slack" };
+function appName(cls) { return APP_NAMES[cls] || String(cls).split(".").pop(); }
+function placeOf(r) {
+  const app = r.app && r.app !== "?" ? appName(r.app) : null;
+  return [app, r.window_title || r.url].filter(Boolean).join(": ");
 }
 
 function drawHistList() {
@@ -600,7 +604,7 @@ function drawHistList() {
     return;
   }
   $("#hist-items").replaceChildren(...rows.slice(0, 600).map((r) => h("li", { "data-id": r.id, class: r.id === S.histSel ? "sel" : "", onclick: () => selectHist(r.id) },
-    h("span", { class: "top" }, h("span", { text: when(r.timestamp) }), h("span", {}, h("span", { text: secs(r.duration) }))),
+    h("span", { class: "top" }, h("span", { text: [when(r.timestamp), placeOf(r)].filter(Boolean).join(", ").slice(0, 64) }), h("span", {}, h("span", { text: secs(r.duration) }))),
     h("span", { class: "txt" + (r.preview ? "" : " none"), text: r.preview || (r.status === "failed" ? `falhou: ${r.error || ""}` : "sem texto") }),
     tagsFor(r).length ? h("span", { class: "tags", style: "justify-content:flex-start" }, tagsFor(r)) : null,
   )));
@@ -610,6 +614,7 @@ let player = null;
 
 async function selectHist(id) {
   S.histSel = id;
+  $("#hist-detail").dataset.id = id;
   $$("#hist-items li").forEach((li) => li.classList.toggle("sel", li.dataset.id === id));
   const box = $("#hist-detail");
   box.replaceChildren(h("p", { class: "note" }, h("span", { class: "spin" }), " abrindo"));
@@ -631,6 +636,7 @@ async function selectHist(id) {
   if (e.text) parts.push(h("h2", { text: s.llm_used ? "Texto colado (limpo pelo LLM)" : "Texto colado" }), h("p", { class: "textbox", text: e.text }));
   if (asr.transcript && asr.transcript !== e.text) parts.push(h("h2", { text: "Transcrição antes da limpeza" }), h("p", { class: "textbox raw", text: asr.transcript }));
   parts.push(h("dl", { class: "meta" },
+    metaItem("Onde", placeOf(s) || null),
     metaItem("Duração", secs(e.duration_secs)),
     metaItem("Idioma", e.language),
     metaItem("Transcreveu", short(s.asr_model)),
@@ -639,7 +645,7 @@ async function selectHist(id) {
     llm.model ? metaItem("Tempo do LLM", s.llm_used ? ms(llm.latency_ms) : "não respondeu") : null,
     metaItem("Custo", usd(cost.reported_usd)),
     cost.llm && cost.llm.total_tokens ? metaItem("Tokens do LLM", nf(cost.llm.total_tokens)) : null,
-    metaItem("Guardado em", s.where === "spool" ? "disco local (aguardando o NAS)" : "arquivo"),
+    metaItem("Guardado em", s.where === "spool" ? "disco local (aguardando o NAS)" : s.source === "wispr" ? "arquivo do Wispr Flow" : "arquivo"),
   ));
   if (failures.length) {
     parts.push(h("h2", { text: failures.length === 1 ? "1 pedido falhou" : `${failures.length} pedidos falharam` }),
@@ -999,11 +1005,17 @@ function wire() {
   $("#pp-text").addEventListener("input", (e) => setValue(INSTR, e.target.value));
   $("#pp-on").addEventListener("change", (e) => setValue(["general", "llm_post_process"], e.target.checked));
 
-  $("#hist-search").addEventListener("input", drawHistList);
+  let searchTimer;
+  $("#hist-search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => renderHist(false), 220); });
   $$("#hist-filter button").forEach((b) => b.addEventListener("click", () => {
     S.histFilter = b.dataset.f;
     $$("#hist-filter button").forEach((x) => x.classList.toggle("on", x === b));
-    drawHistList();
+    renderHist(false);
+  }));
+  $$("#hist-source button").forEach((b) => b.addEventListener("click", () => {
+    S.histSource = b.dataset.s;
+    $$("#hist-source button").forEach((x) => x.classList.toggle("on", x === b));
+    renderHist(false);
   }));
   $("#hist-open").addEventListener("click", () => call("open_path", "archive").catch(fail));
   $("#rec-open").addEventListener("click", () => call("open_path", "recovery").catch(fail));

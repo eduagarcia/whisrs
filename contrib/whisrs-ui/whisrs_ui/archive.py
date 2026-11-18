@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import wave
 from dataclasses import dataclass
 
@@ -184,10 +185,21 @@ def entry_detail(config: dict, entry_id: str) -> dict:
     if loc is None:
         raise FileNotFoundError(f"ditado {entry_id} não encontrado no arquivo")
     data = _read_json(loc.json) or {}
-    wav = loc.json.with_suffix(".wav")
     detail = {"entry": data, "summary": summarize(data, loc.where), "folder": str(loc.json.parent)}
-    detail.update(audio_payload(wav))
+    detail.update(audio_payload(audio_of(loc.json, data)))
     return detail
+
+
+def audio_of(record: pathlib.Path, entry: dict | None = None) -> pathlib.Path:
+    """The audio file of an archived dictation: the one its record names,
+    else a `.flac` or `.wav` beside it."""
+    name = (entry or {}).get("audio_file")
+    if name and (record.parent / name).is_file():
+        return record.parent / name
+    for ext in (".flac", ".wav"):
+        if record.with_suffix(ext).is_file():
+            return record.with_suffix(ext)
+    return record.with_suffix(".flac")
 
 
 # ---------------------------------------------------------------------------
@@ -195,16 +207,32 @@ def entry_detail(config: dict, entry_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def peaks(path: pathlib.Path, bins: int = 480) -> list[float]:
-    """The loudness outline of a 16-bit WAV: `bins` peaks from 0 to 1."""
+def pcm16(path: pathlib.Path) -> bytes | None:
+    """The audio of `path` as 16 kHz mono 16-bit PCM: read directly from a
+    WAV in that format, decoded with ffmpeg otherwise (FLAC)."""
+    if path.suffix.lower() == ".wav":
+        try:
+            with wave.open(str(path), "rb") as w:
+                if (w.getsampwidth(), w.getnchannels(), w.getframerate()) == (2, 1, 16000):
+                    return w.readframes(w.getnframes())
+        except (OSError, wave.Error, EOFError):
+            return None
     try:
-        with wave.open(str(path), "rb") as w:
-            if w.getsampwidth() != 2:
-                return []
-            channels = w.getnchannels()
-            frames = w.readframes(w.getnframes())
-    except (OSError, wave.Error, EOFError):
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+            capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def peaks(path: pathlib.Path, bins: int = 480) -> list[float]:
+    """The loudness outline of a dictation's audio: `bins` peaks from 0 to 1."""
+    frames = pcm16(path)
+    if not frames:
         return []
+    channels = 1
     import array
 
     samples = array.array("h")
@@ -230,7 +258,7 @@ def audio_payload(path: pathlib.Path) -> dict:
     if size == 0:
         return {"audio": None, "peaks": [], "silent": True}
     data = base64.b64encode(path.read_bytes()).decode("ascii")
-    mime = "audio/wav" if path.suffix.lower() == ".wav" else "audio/ogg"
+    mime = {".wav": "audio/wav", ".flac": "audio/flac"}.get(path.suffix.lower(), "audio/ogg")
     return {"audio": f"data:{mime};base64,{data}", "peaks": peaks(path), "bytes": size}
 
 
@@ -287,14 +315,26 @@ def copy_to_recovery(config: dict, entry_id: str) -> str:
     """Put an archived dictation's audio in the recovery folder, so `whisrs
     transcribe-recovery` sends it again. Returns the file name."""
     loc = find(config, entry_id)
-    if loc is None:
-        raise FileNotFoundError(f"ditado {entry_id} não encontrado no arquivo")
-    wav = loc.json.with_suffix(".wav")
-    if not wav.is_file():
+    audio = audio_of(loc.json, _read_json(loc.json)) if loc else None
+    return copy_audio_to_recovery(audio)
+
+
+def copy_audio_to_recovery(audio: pathlib.Path | None) -> str:
+    """Put `audio` in the recovery folder as the WAV `whisrs
+    transcribe-recovery` reads (16 kHz mono 16-bit), decoding a FLAC.
+    Returns the file name."""
+    if audio is None or not audio.is_file():
         raise FileNotFoundError("esse ditado não tem áudio guardado")
+    frames = pcm16(audio)
+    if not frames:
+        raise RuntimeError(f"não consegui ler o áudio {audio}")
     folder = recovery_dir()
     folder.mkdir(parents=True, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     name = f"recovery_{stamp}_ui.wav"
-    shutil.copyfile(wav, folder / name)
+    with wave.open(str(folder / name), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(frames)
     return name

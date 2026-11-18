@@ -1458,6 +1458,19 @@ pub(crate) async fn transcribe_recording_batch(
 
     info!("collected {} audio samples", samples.len());
 
+    // For the archive: the window focused at the stop, where the text is
+    // meant to go. Only read when there is an archive.
+    let window = context
+        .config
+        .general
+        .archive_dir
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty())
+        .then(|| crate::archive::Window {
+            class: context.window_tracker.get_focused_window_class(),
+            title: context.window_tracker.get_focused_window_title(),
+        });
+
     // Inside a capture scope, so the dictation archive (`[general]
     // archive_dir`) gets what the backend and the LLM answered.
     let (result, captured) = whisrs::capture::scope(async {
@@ -1513,6 +1526,7 @@ pub(crate) async fn transcribe_recording_batch(
                 text,
                 post_processed,
                 error,
+                window,
             },
         );
     }

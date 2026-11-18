@@ -199,7 +199,7 @@ impl Source for PcmSource<'_> {
 /// minimum block size differs (see below). Besides `wav`, memory is the FLAC
 /// output and one block.
 #[cfg(feature = "recording")]
-pub(crate) fn wav_to_flac(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn wav_to_flac(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut source = PcmSource::new(wav)?;
     let config = flacenc::config::Encoder::default()
         .into_verified()

@@ -395,7 +395,7 @@ When the file exists, `whisrs config` shows the merged list and writes a changed
 `[general] archive_dir = "/path/to/folder"` keeps every batch dictation the backend was asked
 about, failed ones and failed requests included (`status`, `error`, `asr.failures`):
 
-- `YYYY-MM/<UTC time>_<id>.wav`: the audio, 16 kHz mono.
+- `YYYY-MM/<UTC time>_<id>.flac`: the audio, 16 kHz mono, lossless (WAV without `recording`).
 - `YYYY-MM/<UTC time>_<id>.json`: the transcription backend's response and the LLM's, each
   whole as it came, how long each took, the transcript, the text that was typed, and the
   cost.

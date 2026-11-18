@@ -34,6 +34,9 @@ struct HyprctlActiveWindow {
     /// Window class (e.g. "Alacritty", "firefox").
     #[serde(default)]
     class: String,
+    /// Window title.
+    #[serde(default)]
+    title: String,
 }
 
 impl WindowTracker for HyprlandTracker {
@@ -54,6 +57,19 @@ impl WindowTracker for HyprlandTracker {
 
         debug!("hyprland focused window: {}", parsed.address);
         Ok(parsed.address)
+    }
+
+    fn get_focused_window_title(&self) -> Option<String> {
+        let output = Command::new("hyprctl")
+            .args(["activewindow", "-j"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let parsed: HyprctlActiveWindow =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).ok()?;
+        (!parsed.title.is_empty()).then_some(parsed.title)
     }
 
     fn get_focused_window_class(&self) -> Option<String> {

@@ -31,6 +31,14 @@ pub trait WindowTracker: Send + Sync {
     /// new tracker inherited the gap without a compile error. A backend that
     /// cannot answer has to say so with an explicit `None`.
     fn get_focused_window_class(&self) -> Option<String>;
+
+    /// The title of the currently focused window, for the dictation archive
+    /// (which app and which page or chat a dictation was for). Nothing
+    /// decides on it, so unlike the class it may be left unanswered: the
+    /// default is `None`, and only Hyprland answers.
+    fn get_focused_window_title(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A no-op tracker that always succeeds without doing anything.

@@ -20,9 +20,11 @@
 //!   mounted leaves an empty mount point, and writing there would fill the
 //!   local disk under it. A folder that is missing counts as unreachable.
 //!
-//! A dictation is two files, `<UTC time>_<id>.wav` and `.json`, in a folder
-//! per month, plus one line in `costs.jsonl` at the top. The `.json` is
-//! written last in the spool, so its presence means the dictation is whole.
+//! A dictation is two files, `<UTC time>_<id>.flac` (lossless, half the
+//! size of the WAV; `.wav` in a build without the `recording` feature, which
+//! has no FLAC encoder) and `.json`, in a folder per month, plus one line in
+//! `costs.jsonl` at the top. The `.json` is written last in the spool, so its
+//! presence means the dictation is whole.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -66,6 +68,31 @@ pub(crate) struct Dictation {
     pub(crate) post_processed: bool,
     /// Why the dictation failed (no text came of it), when it did.
     pub(crate) error: Option<String>,
+    /// The window focused when the dictation stopped: where the text was
+    /// meant to go.
+    pub(crate) window: Option<Window>,
+}
+
+/// A window, as the archive names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub(crate) class: Option<String>,
+    pub(crate) title: Option<String>,
+}
+
+/// The audio files a dictation can have, the one written first.
+const AUDIO_EXTENSIONS: [&str; 2] = ["flac", "wav"];
+
+/// The dictation's audio as the archive keeps it: FLAC when this build can
+/// encode it, else the WAV. Returns the extension and the bytes.
+fn archived_audio(samples: &[i16]) -> anyhow::Result<(&'static str, Vec<u8>)> {
+    let wav = whisrs::audio::wav::encode_wav(samples)?;
+    #[cfg(feature = "recording")]
+    match whisrs::transcription::wav_to_flac(&wav) {
+        Ok(flac) => return Ok(("flac", flac)),
+        Err(e) => warn!("dictation archive: FLAC failed, keeping the WAV: {e:#}"),
+    }
+    Ok(("wav", wav))
 }
 
 impl Dictation {
@@ -131,7 +158,7 @@ pub(crate) fn flush_in_background(dir: PathBuf) {
         .spawn(move || sync(&spool_dir(), &dir));
 }
 
-/// Write `dictation` to `spool` as `<stem>.wav` then `<stem>.json`.
+/// Write `dictation` to `spool` as its audio (`<stem>.flac`) then `<stem>.json`.
 /// Returns the stem.
 fn write_to_spool(
     spool: &Path,
@@ -145,9 +172,10 @@ fn write_to_spool(
         now.timestamp_subsec_micros() & 0xff_ffff,
         SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0xff
     );
-    let wav = whisrs::audio::wav::encode_wav(&dictation.samples)?;
-    write_whole(&spool.join(format!("{stem}.wav")), &wav)?;
-    let entry = entry_json(dictation, &stem, now);
+    let (ext, audio) = archived_audio(&dictation.samples)?;
+    write_whole(&spool.join(format!("{stem}.{ext}")), &audio)?;
+    let mut entry = entry_json(dictation, &stem, now);
+    entry["audio_file"] = json!(format!("{stem}.{ext}"));
     write_whole(
         &spool.join(format!("{stem}.json")),
         serde_json::to_string_pretty(&entry)?.as_bytes(),
@@ -162,10 +190,12 @@ fn entry_json(dictation: &Dictation, stem: &str, now: DateTime<Utc>) -> Value {
     json!({
         "id": stem,
         "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "audio_file": format!("{stem}.wav"),
+        "audio_file": format!("{stem}.{}", AUDIO_EXTENSIONS[0]),
         "duration_secs": dictation.samples.len() as f64 / 16_000.0,
         "language": dictation.language,
         "backend": dictation.backend,
+        // Where the text was meant to go: the focused window at the stop.
+        "window": dictation.window.as_ref().map(|w| json!({ "class": w.class, "title": w.title })),
         // "failed": no text came of it, and `error` says why.
         "status": if dictation.error.is_some() { "failed" } else { "ok" },
         "error": dictation.error,
@@ -333,7 +363,11 @@ fn sync_spool(spool: &Path, dir: &Path) -> anyhow::Result<usize> {
     let mut moved = 0;
     for stem in stems {
         let json_path = spool.join(format!("{stem}.json"));
-        let wav_path = spool.join(format!("{stem}.wav"));
+        let audio_paths: Vec<PathBuf> = AUDIO_EXTENSIONS
+            .iter()
+            .map(|ext| spool.join(format!("{stem}.{ext}")))
+            .filter(|p| p.is_file())
+            .collect();
         let entry: Value = serde_json::from_slice(&std::fs::read(&json_path)?)?;
         // 20261117T220115Z_... -> 2026-11
         let month = match (stem.get(0..4), stem.get(4..6)) {
@@ -342,11 +376,9 @@ fn sync_spool(spool: &Path, dir: &Path) -> anyhow::Result<usize> {
         };
         let month_dir = dir.join(month);
         std::fs::create_dir_all(&month_dir)?;
-        if wav_path.is_file() {
-            write_whole(
-                &month_dir.join(format!("{stem}.wav")),
-                &std::fs::read(&wav_path)?,
-            )?;
+        for audio in &audio_paths {
+            let name = audio.file_name().expect("a spooled file has a name");
+            write_whole(&month_dir.join(name), &std::fs::read(audio)?)?;
         }
         write_whole(
             &month_dir.join(format!("{stem}.json")),
@@ -356,7 +388,9 @@ fn sync_spool(spool: &Path, dir: &Path) -> anyhow::Result<usize> {
         // Only now is it safe to forget the local copy. The .json goes
         // first: without it the pair no longer counts as a dictation.
         std::fs::remove_file(&json_path)?;
-        let _ = std::fs::remove_file(&wav_path);
+        for audio in &audio_paths {
+            let _ = std::fs::remove_file(audio);
+        }
         moved += 1;
     }
     Ok(moved)
@@ -417,6 +451,19 @@ mod tests {
             text: "Oi, tudo bem?".into(),
             post_processed: true,
             error: None,
+            window: Some(Window {
+                class: Some("com.t3tools.T3Code".into()),
+                title: Some("T3 Code".into()),
+            }),
+        }
+    }
+
+    /// The extension the archive writes in this build.
+    fn audio_ext() -> &'static str {
+        if cfg!(feature = "recording") {
+            "flac"
+        } else {
+            "wav"
         }
     }
 
@@ -439,8 +486,15 @@ mod tests {
         assert_eq!(sync_spool(&spool, &dir).unwrap(), 1);
 
         let month = dir.join("2026-11");
-        let wav = std::fs::read(month.join(format!("{stem}.wav"))).unwrap();
-        assert_eq!(&wav[..4], b"RIFF");
+        let audio = std::fs::read(month.join(format!("{stem}.{}", audio_ext()))).unwrap();
+        assert_eq!(
+            &audio[..4],
+            if cfg!(feature = "recording") {
+                b"fLaC"
+            } else {
+                b"RIFF"
+            }
+        );
         let entry: Value =
             serde_json::from_slice(&std::fs::read(month.join(format!("{stem}.json"))).unwrap())
                 .unwrap();
@@ -451,6 +505,9 @@ mod tests {
             "Oi, tudo bem?"
         );
         assert_eq!(entry["text"], "Oi, tudo bem?");
+        assert_eq!(entry["audio_file"], format!("{stem}.{}", audio_ext()));
+        assert_eq!(entry["window"]["class"], "com.t3tools.T3Code");
+        assert_eq!(entry["window"]["title"], "T3 Code");
         assert_eq!(entry["duration_secs"], 1.0);
         assert_eq!(entry["cost"]["asr"]["usd"], 0.0000278);
         assert_eq!(entry["cost"]["llm"]["total_tokens"], 86);
@@ -590,7 +647,7 @@ mod tests {
         let stem = write_to_spool(&spool, &d, now()).unwrap();
         assert_eq!(sync_spool(&spool, &dir).unwrap(), 1);
         let month = dir.join("2026-11");
-        assert!(month.join(format!("{stem}.wav")).is_file());
+        assert!(month.join(format!("{stem}.{}", audio_ext())).is_file());
         let entry: Value =
             serde_json::from_slice(&std::fs::read(month.join(format!("{stem}.json"))).unwrap())
                 .unwrap();

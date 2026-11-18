@@ -19,6 +19,29 @@ pipeline is doing, its settings, every archived dictation, and the commands.
   CLI commands, the cue sounds, every key of the
   [config reference](../../docs/config-reference.md), and the file itself.
 
+## The dictation index
+
+`whisrs_ui/history.py` (`whisrs-history`, standard library only) builds one
+SQLite file with full-text search (accents ignored) from the archive folder
+and from a Wispr Flow export beside it (`../wispr-flow-archive`): the text,
+the transcript before the cleanup, the app and window, models, latencies,
+cost, every failed request and the audio path of each dictation.
+
+```sh
+whisrs-history update                       # build or bring up to date, then publish
+whisrs-history search "openrouter" --since 7d --app slack
+whisrs-history show 20261118T184538Z_0745ae25
+whisrs-history stats --by model
+whisrs-history sql "SELECT local_ts, text FROM dictations WHERE llm_used = 0"
+```
+
+The archive stays the source of truth; the index can be deleted and rebuilt.
+SQLite must not be written over a network share, so `update` writes
+`~/.local/share/whisrs/dictations.sqlite` and publishes a copy as
+`<archive_dir>/index/dictations.sqlite` by replacing the file whole: other
+machines open that copy read-only. The window's Histórico page searches the
+same index.
+
 Saving writes `config.toml` with its comments kept (through a symlink, if it
 is one), keeps the previous file in `~/.local/state/whisrs-ui/backups/`, and
 restarts the daemon once it is idle. A daemon that does not come back puts the
@@ -30,6 +53,7 @@ Needs `uv`, `python-gobject` and `webkit2gtk-4.1` (Arch package names).
 
 ```sh
 ln -s "$PWD/whisrs-ui" ~/.local/bin/whisrs-ui
+ln -s "$PWD/whisrs-history" ~/.local/bin/whisrs-history
 install -Dm644 whisrs-ui.desktop ~/.local/share/applications/whisrs-ui.desktop
 install -Dm644 whisrs-ui.svg ~/.local/share/icons/hicolor/scalable/apps/whisrs-ui.svg
 ```

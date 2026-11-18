@@ -62,6 +62,10 @@ pub mod local_whisper {
 }
 pub mod factory;
 mod flac;
+/// Lossless FLAC of a 16 kHz mono WAV: the dictation archive keeps its audio
+/// so, in half the bytes.
+#[cfg(feature = "recording")]
+pub use flac::wav_to_flac;
 pub mod openai_compatible_realtime;
 pub mod openai_realtime;
 pub mod openai_realtime_protocol;

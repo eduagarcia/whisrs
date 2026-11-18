@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Search every dictation (whisrs and the Wispr Flow history): whisrs-history --help.
+# Standard library only, so it needs no venv.
+set -euo pipefail
+DIR="$(dirname "$(readlink -f "$0")")"
+UV="$(command -v uv || true)"
+[ -n "$UV" ] || UV="$HOME/.local/bin/uv"
+exec "$UV" run --quiet --no-project python "$DIR/whisrs_ui/history.py" "$@"
